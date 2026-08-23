@@ -13,6 +13,13 @@ import (
 )
 
 // TestClientConfig tests the parsing of the client config
+// Addressable so the pointer fields in the expected pppSSTPConfig can refer to
+// them; a composite literal cannot take the address of a constant.
+var (
+	testPPPMSSClamp    = 1360
+	testPPPServerRoute = true
+)
+
 func TestClientConfig(t *testing.T) {
 	viper.SetConfigFile("client_test.yaml")
 	err := viper.ReadInConfig()
@@ -131,6 +138,24 @@ func TestClientConfig(t *testing.T) {
 		},
 		TCPRedirect: &tcpRedirectConfig{
 			Listen: "127.0.0.1:3500",
+		},
+		PPP: &pppConfig{
+			Mode:        "sstp",
+			MTU:         1400,
+			PPPDPath:    "/usr/sbin/pppd",
+			PPPDArgs:    []string{"defaultroute", "+ipv6"},
+			DataStreams: 20,
+			SSTP: &pppSSTPConfig{
+				BinaryPath:  "/usr/sbin/sstpc",
+				Listen:      "127.0.0.1:8443",
+				CertDir:     "/etc/hysteria/sstp",
+				Endpoint:    "sstp.example.com:443",
+				User:        "sstp_user",
+				Password:    "sstp_pass",
+				MSSClamp:    &testPPPMSSClamp,
+				ServerRoute: &testPPPServerRoute,
+				LogLevel:    "debug",
+			},
 		},
 		TUN: &tunConfig{
 			Name:    "hytun",

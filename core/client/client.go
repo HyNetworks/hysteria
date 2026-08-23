@@ -7,12 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	coreErrs "github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
+	"github.com/apernet/hysteria/core/v2/ppp"
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
@@ -26,8 +28,28 @@ const (
 type Client interface {
 	TCP(addr string) (net.Conn, error)
 	UDP() (HyUDPConn, error)
+	PPP(dataStreams, maxFrameSize int) (*PPPConn, error)
+	RemoteAddr() net.Addr
 	Close() error
 }
+
+// PPPConn represents a PPP connection with separate control stream and data IO.
+type PPPConn struct {
+	ControlStream *utils.QStream
+	Data          ppp.PPPDataIO
+	// MTU is the PPP MTU the server settled on for this session, derived from
+	// whichever direction's transport carries less. 0 when the server did not
+	// compute one.
+	MTU     int
+	closeFn func() error
+}
+
+func (c *PPPConn) Close() error {
+	return c.closeFn()
+}
+
+// ensure PPPConn is not unexported
+var _ = &PPPConn{}
 
 type HyUDPConn interface {
 	Receive() ([]byte, string, error)
@@ -63,7 +85,8 @@ type clientImpl struct {
 	tr      *quic.Transport
 	conn    *quic.Conn
 
-	udpSM *udpSessionManager
+	udpSM      *udpSessionManager
+	dispatcher *clientDatagramDispatcher
 }
 
 func (c *clientImpl) connect() (*HandshakeInfo, error) {
@@ -170,7 +193,13 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	c.pktConn = pktConn
 	c.tr = tr
 	c.conn = conn
-	if authResp.UDPEnabled {
+	if c.config.PPPMode {
+		c.dispatcher = newClientDatagramDispatcher(conn)
+		go c.dispatcher.run()
+		if authResp.UDPEnabled {
+			c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn, RecvCh: c.dispatcher.udpCh})
+		}
+	} else if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
 	}
 	return &HandshakeInfo{
@@ -235,6 +264,10 @@ func (c *clientImpl) UDP() (HyUDPConn, error) {
 		return nil, coreErrs.DialError{Message: "UDP not enabled"}
 	}
 	return c.udpSM.NewUDP()
+}
+
+func (c *clientImpl) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
 }
 
 func (c *clientImpl) Close() error {
@@ -312,19 +345,28 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 }
 
 type udpIOImpl struct {
-	Conn *quic.Conn
+	Conn   *quic.Conn
+	RecvCh <-chan []byte // nil = read directly from conn (non-PPP mode)
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 	for {
-		msg, err := io.Conn.ReceiveDatagram(context.Background())
-		if err != nil {
-			// Connection error, this will stop the session manager
-			return nil, err
+		var msg []byte
+		if io.RecvCh != nil {
+			var ok bool
+			msg, ok = <-io.RecvCh
+			if !ok {
+				return nil, errors.New("connection closed")
+			}
+		} else {
+			var err error
+			msg, err = io.Conn.ReceiveDatagram(context.Background())
+			if err != nil {
+				return nil, err
+			}
 		}
 		udpMsg, err := protocol.ParseUDPMessage(msg)
 		if err != nil {
-			// Invalid message, this is fine - just wait for the next
 			continue
 		}
 		return udpMsg, nil
@@ -338,4 +380,38 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 		return nil
 	}
 	return io.Conn.SendDatagram(buf[:msgN])
+}
+
+// clientDatagramDispatcher multiplexes incoming QUIC datagrams between
+// UDP proxy and PPP data when PPPMode is enabled.
+type clientDatagramDispatcher struct {
+	conn      *quic.Conn
+	udpCh     chan []byte
+	pppCh     chan []byte // nil until PPP activates
+	pppActive atomic.Bool
+}
+
+func newClientDatagramDispatcher(conn *quic.Conn) *clientDatagramDispatcher {
+	return &clientDatagramDispatcher{
+		conn:  conn,
+		udpCh: make(chan []byte, 256),
+	}
+}
+
+func (d *clientDatagramDispatcher) run() {
+	for {
+		msg, err := d.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			close(d.udpCh)
+			if d.pppCh != nil {
+				close(d.pppCh)
+			}
+			return
+		}
+		if d.pppActive.Load() && d.pppCh != nil {
+			d.pppCh <- msg
+		} else {
+			d.udpCh <- msg
+		}
+	}
 }

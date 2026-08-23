@@ -204,6 +204,26 @@ func TestServerConfig(t *testing.T) {
 			Listen: ":9999",
 			Secret: "its_me_mario",
 		},
+		PPP: pppServerConfig{
+			Enabled:  true,
+			Mode:     "l2tp",
+			PPPDPath: "/usr/sbin/pppd",
+			PPPDArgs: []string{"debug"},
+			Sudo:     true,
+			IPv4Pool: "10.0.0.0/24",
+			DNS:      []string{"8.8.8.8", "8.8.4.4"},
+			MTU:      1420,
+			L2TP: pppL2TPConfig{
+				Hostname:      "hysteria-lac",
+				HelloInterval: 60,
+				Groups: map[string]pppL2TPGroupConfig{
+					"default": {LNS: []pppLNSConfig{
+						{Address: "192.0.2.10:1701", Secret: "l2tp_secret", Weight: 1},
+					}},
+				},
+				Routes: []pppRouteConfig{{ID: "*", Group: "default"}},
+			},
+		},
 		Masquerade: serverConfigMasquerade{
 			Type: "proxy",
 			File: serverConfigMasqueradeFile{
@@ -354,4 +374,22 @@ func TestRealmConnectAddrsCacheHit(t *testing.T) {
 	// Mutating the returned slice must not affect the cached one.
 	got[0] = netip.MustParseAddrPort("198.51.100.1:1")
 	assert.Equal(t, want, rt.addrs)
+}
+
+// TestServerConfigPPPIPv6Only tests parsing a PPP config with no ipv4Pool (IPv6-only mode).
+func TestServerConfigPPPIPv6Only(t *testing.T) {
+	v := viper.New()
+	v.SetConfigFile("server_ppp_v6only_test.yaml")
+	err := v.ReadInConfig()
+	assert.NoError(t, err)
+	var config serverConfig
+	err = v.Unmarshal(&config)
+	assert.NoError(t, err)
+
+	assert.True(t, config.PPP.Enabled)
+	assert.Equal(t, "", config.PPP.IPv4Pool)
+	assert.Equal(t, uint32(1400), config.PPP.MTU)
+	assert.Nil(t, config.PPP.DNS)
+	assert.Empty(t, config.PPP.PPPDPath)
+	assert.Nil(t, config.PPP.PPPDArgs)
 }

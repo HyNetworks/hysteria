@@ -162,6 +162,31 @@ trafficStats:
   listen: :9999
   secret: its_me_mario
 
+ppp:
+  enabled: true
+  mode: l2tp
+  pppdPath: "/usr/sbin/pppd"
+  pppdArgs:
+    - debug
+  sudo: true
+  ipv4Pool: "10.0.0.0/24"
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+  mtu: 1420
+  l2tp:
+    hostname: "hysteria-lac"
+    helloInterval: 60
+    groups:
+      default:
+        lns:
+          - address: "192.0.2.10:1701"
+            secret: "l2tp_secret"
+            weight: 1
+    routes:
+      - id: "*"
+        group: default
+
 masquerade:
   type: proxy
   file:

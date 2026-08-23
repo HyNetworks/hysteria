@@ -1,0 +1,13 @@
+listen: ":443"
+
+tls:
+  cert: test.crt
+  key: test.key
+
+auth:
+  type: password
+  password: test
+
+ppp:
+  enabled: true
+  mtu: 1400

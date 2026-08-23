@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -15,14 +16,59 @@ import (
 	"github.com/apernet/quic-go/quicvarint"
 
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
+	internalppp "github.com/apernet/hysteria/core/v2/internal/ppp"
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
+	"github.com/apernet/hysteria/core/v2/ppp"
 )
 
 const (
 	closeErrCodeOK                  = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
 )
+
+// datagramDispatcher routes incoming QUIC datagrams to either
+// the UDP session manager or the PPP data handler, depending on
+// whether PPP mode is active for this connection.
+type datagramDispatcher struct {
+	conn      *quic.Conn
+	udpSM     *udpSessionManager
+	udpCh     chan []byte
+	pppCh     chan []byte
+	pppActive atomic.Bool
+	once      sync.Once
+}
+
+func (d *datagramDispatcher) start() {
+	d.once.Do(func() {
+		go d.run()
+	})
+}
+
+func newDatagramDispatcher(conn *quic.Conn) *datagramDispatcher {
+	return &datagramDispatcher{
+		conn:  conn,
+		udpCh: make(chan []byte, 256),
+	}
+}
+
+func (d *datagramDispatcher) run() {
+	for {
+		msg, err := d.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			close(d.udpCh)
+			if d.pppCh != nil {
+				close(d.pppCh)
+			}
+			return
+		}
+		if d.pppActive.Load() && d.pppCh != nil {
+			d.pppCh <- msg
+		} else {
+			d.udpCh <- msg
+		}
+	}
+}
 
 type Server interface {
 	Serve() error
@@ -149,14 +195,20 @@ type h3sHandler struct {
 	authID        string
 	connID        uint32 // a random id for dump streams
 
-	udpSM *udpSessionManager // Only set after authentication
+	dispatcher *datagramDispatcher
+
+	pppMu           sync.Mutex
+	pppActive       bool
+	pppDone         chan struct{}
+	pppDataStreamCh chan *quic.Stream
 }
 
 func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
 	return &h3sHandler{
-		config: config,
-		conn:   conn,
-		connID: rand.Uint32(),
+		config:     config,
+		conn:       conn,
+		connID:     rand.Uint32(),
+		dispatcher: newDatagramDispatcher(conn),
 	}
 }
 
@@ -213,17 +265,23 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if el := h.config.EventLogger; el != nil {
 				el.Connect(h.conn.RemoteAddr(), id, actualTx)
 			}
-			// Initialize UDP session manager (if UDP is enabled)
-			// We use sync.Once to make sure that only one goroutine is started,
-			// as ServeHTTP may be called by multiple goroutines simultaneously
+			// Start datagram dispatcher and UDP session manager (if UDP is enabled)
 			if !h.config.DisableUDP {
+				h.dispatcher.start()
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{
+							Conn:          h.conn,
+							DatagramCh:    h.dispatcher.udpCh,
+							AuthID:        id,
+							TrafficLogger: h.config.TrafficLogger,
+							RequestHook:   h.config.RequestHook,
+							Outbound:      h.config.Outbound,
+						},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout,
 					)
-					h.udpSM = sm
+					h.dispatcher.udpSM = sm
 					go sm.Run()
 				}()
 			}
@@ -252,6 +310,114 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		// Wraps the stream with QStream, which handles Close() properly
 		qStream := &utils.QStream{Stream: stream}
 		go h.handleTCPRequest(qStream)
+		return true, nil
+	case protocol.FrameTypePPPRequest:
+		// Consume the frame type varint
+		if _, err := quicvarint.Read(quicvarint.NewReader(stream)); err != nil {
+			return false, err
+		}
+		dataStreams, clientMaxFrame, err := protocol.ReadPPPRequest(stream)
+		if err != nil {
+			return false, err
+		}
+		qStream := &utils.QStream{Stream: stream}
+		if h.config.PPPRequestHandler == nil {
+			_ = protocol.WritePPPResponse(qStream, false, "PPP not enabled on server", 0, 0)
+			_ = qStream.Close()
+			return true, nil
+		}
+		h.pppMu.Lock()
+		if h.pppActive {
+			done := h.pppDone
+			h.pppMu.Unlock()
+			select {
+			case <-done:
+				h.pppMu.Lock()
+			case <-time.After(5 * time.Second):
+				_ = protocol.WritePPPResponse(qStream, false, "PPP session already active", 0, 0)
+				_ = qStream.Close()
+				return true, nil
+			}
+		}
+		h.pppActive = true
+		h.pppDone = make(chan struct{})
+		h.pppMu.Unlock()
+
+		// Measure only now that the request is definitely being served: this waits
+		// on Path MTU discovery, and the rejection paths above must not pay for it.
+		// Discovery is still climbing at this point -- it advances on acknowledged
+		// traffic, not elapsed time -- so StableDatagramBudget drives its own.
+		//
+		// Both figures are floors, not caps. Discovery is paced entirely in round
+		// trips, so a constant chosen here cannot say how long it needs; it is
+		// widened from the connection's own RTT, up to a bound the callee holds.
+		// Sizing a session against a figure discovery had not reached yet is what
+		// this used to do, and it cost every link on a WAN path a sixth of its MTU
+		// for the life of the session.
+		serverMaxFrame := protocol.MaxPPPFrameSize
+		if dataStreams == 0 {
+			serverMaxFrame = internalppp.StableDatagramBudget(h.conn, 400*time.Millisecond, 3*time.Second)
+		}
+		pppParams := ppp.SessionParams{
+			DataStreams:    dataStreams,
+			ClientMaxFrame: clientMaxFrame,
+			ServerMaxFrame: serverMaxFrame,
+		}
+
+		if dataStreams > 0 {
+			h.pppDataStreamCh = make(chan *quic.Stream, dataStreams)
+		}
+
+		createDataIO := func() (ppp.PPPDataIO, error) {
+			if dataStreams == 0 {
+				h.dispatcher.pppCh = make(chan []byte, 256)
+				h.dispatcher.pppActive.Store(true)
+				h.dispatcher.start()
+				return internalppp.NewDatagramIO(h.conn, h.dispatcher.pppCh), nil
+			}
+			return internalppp.CollectDataStreams(h.pppDataStreamCh, dataStreams, 10*time.Second, nil)
+		}
+
+		go func() {
+			h.config.PPPRequestHandler.HandlePPP(qStream, pppParams, createDataIO, h.conn.RemoteAddr(), h.authID)
+			h.pppMu.Lock()
+			h.dispatcher.pppActive.Store(false)
+			oldCh := h.pppDataStreamCh
+			h.pppDataStreamCh = nil
+			h.pppActive = false
+			close(h.pppDone)
+			h.pppMu.Unlock()
+			if oldCh != nil {
+				for {
+					select {
+					case s := <-oldCh:
+						_ = s.Close()
+					default:
+						return
+					}
+				}
+			}
+		}()
+		return true, nil
+	case protocol.FrameTypePPPData:
+		h.pppMu.Lock()
+		ch := h.pppDataStreamCh
+		h.pppMu.Unlock()
+		if ch == nil {
+			return false, nil
+		}
+		if _, err := quicvarint.Read(quicvarint.NewReader(stream)); err != nil {
+			return false, err
+		}
+		// Read and discard stream_index varint
+		if _, err := quicvarint.Read(quicvarint.NewReader(stream)); err != nil {
+			return false, err
+		}
+		select {
+		case ch <- stream:
+		default:
+			_ = stream.Close()
+		}
 		return true, nil
 	default:
 		return false, nil
@@ -359,6 +525,7 @@ func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
 // udpIOImpl is the IO implementation for udpSessionManager with TrafficLogger support
 type udpIOImpl struct {
 	Conn          *quic.Conn
+	DatagramCh    <-chan []byte
 	AuthID        string
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
@@ -367,20 +534,17 @@ type udpIOImpl struct {
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 	for {
-		msg, err := io.Conn.ReceiveDatagram(context.Background())
-		if err != nil {
-			// Connection error, this will stop the session manager
-			return nil, err
+		msg, ok := <-io.DatagramCh
+		if !ok {
+			return nil, errors.New("connection closed")
 		}
 		udpMsg, err := protocol.ParseUDPMessage(msg)
 		if err != nil {
-			// Invalid message, this is fine - just wait for the next
 			continue
 		}
 		if io.TrafficLogger != nil {
 			ok := io.TrafficLogger.LogTraffic(io.AuthID, uint64(len(udpMsg.Data)), 0)
 			if !ok {
-				// TrafficLogger requested to disconnect the client
 				_ = io.Conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
 				return nil, errDisconnect
 			}

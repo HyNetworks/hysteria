@@ -28,4 +28,6 @@ var (
 	authResponsePadding = padding{Min: 256, Max: 2048}
 	tcpRequestPadding   = padding{Min: 64, Max: 512}
 	tcpResponsePadding  = padding{Min: 128, Max: 1024}
+	pppRequestPadding   = padding{Min: 64, Max: 512}
+	pppResponsePadding  = padding{Min: 128, Max: 1024}
 )

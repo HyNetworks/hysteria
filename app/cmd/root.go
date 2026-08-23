@@ -101,9 +101,16 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 	},
 }
 
+// Exits before runClient gets a chance to guard them itself. Unreachable on the
+// command line the OpenWrt handler generates -- it passes only "client -c <file>"
+// -- but pppd re-splits that pty string through a second shell, so a future
+// option carrying a stray token would land here, and here exits fast enough to
+// spawn pppd as quickly as the two can be forked. holdPPPRestart is package
+// level and reads only the environment, so it works before logger exists.
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
+		holdPPPRestart()
 		os.Exit(1)
 	}
 }
@@ -136,15 +143,20 @@ func initConfig() {
 	}
 }
 
+// Same reasoning as Execute: these run from cobra.OnInitialize, before any
+// command body, and exit without a logger. Reachable only through
+// HYSTERIA_LOG_LEVEL or HYSTERIA_LOG_FORMAT, which the handler does not set.
 func initLogger() {
 	level, ok := logLevelMap[strings.ToLower(logLevel)]
 	if !ok {
 		fmt.Printf("unsupported log level: %s\n", logLevel)
+		holdPPPRestart()
 		os.Exit(1)
 	}
 	enc, ok := logFormatMap[strings.ToLower(logFormat)]
 	if !ok {
 		fmt.Printf("unsupported log format: %s\n", logFormat)
+		holdPPPRestart()
 		os.Exit(1)
 	}
 	c := zap.Config{
@@ -160,6 +172,7 @@ func initLogger() {
 	logger, err = c.Build()
 	if err != nil {
 		fmt.Printf("failed to initialize logger: %s\n", err)
+		holdPPPRestart()
 		os.Exit(1)
 	}
 }

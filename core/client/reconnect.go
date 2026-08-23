@@ -99,6 +99,24 @@ func (rc *reconnectableClientImpl) TCP(addr string) (net.Conn, error) {
 	}
 }
 
+func (rc *reconnectableClientImpl) PPP(dataStreams, maxFrameSize int) (*PPPConn, error) {
+	c, err := rc.clientDo(func(client Client) (interface{}, error) {
+		return client.PPP(dataStreams, maxFrameSize)
+	})
+	if err != nil {
+		// In PPP mode the client is exclusively for PPP, so any failure
+		// makes the connection useless. Close and reset so the next call reconnects.
+		rc.m.Lock()
+		if rc.client != nil {
+			_ = rc.client.Close()
+			rc.client = nil
+		}
+		rc.m.Unlock()
+		return nil, err
+	}
+	return c.(*PPPConn), nil
+}
+
 func (rc *reconnectableClientImpl) UDP() (HyUDPConn, error) {
 	if c, err := rc.clientDo(func(client Client) (interface{}, error) {
 		return client.UDP()
@@ -107,6 +125,15 @@ func (rc *reconnectableClientImpl) UDP() (HyUDPConn, error) {
 	} else {
 		return c.(HyUDPConn), nil
 	}
+}
+
+func (rc *reconnectableClientImpl) RemoteAddr() net.Addr {
+	rc.m.Lock()
+	defer rc.m.Unlock()
+	if rc.client != nil {
+		return rc.client.RemoteAddr()
+	}
+	return nil
 }
 
 func (rc *reconnectableClientImpl) Close() error {

@@ -27,6 +27,7 @@ type Config struct {
 	CongestionConfig CongestionConfig
 	BandwidthConfig  BandwidthConfig
 	FastOpen         bool
+	PPPMode          bool // Enable datagram dispatcher for PPP datagram mode (dataStreams=0)
 
 	filled bool // whether the fields have been verified and filled
 }

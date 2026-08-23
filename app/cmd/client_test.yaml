@@ -107,6 +107,25 @@ udpTProxy:
 tcpRedirect:
   listen: 127.0.0.1:3500
 
+ppp:
+  mode: sstp
+  mtu: 1400
+  pppdPath: "/usr/sbin/pppd"
+  pppdArgs:
+    - defaultroute
+    - "+ipv6"
+  dataStreams: 20  # 0 or omit for datagram mode, >0 for multi-stream mode
+  sstp:
+    binaryPath: "/usr/sbin/sstpc"
+    listen: "127.0.0.1:8443"
+    certDir: "/etc/hysteria/sstp"
+    endpoint: "sstp.example.com:443"
+    user: "sstp_user"
+    password: "sstp_pass"
+    mssClamp: 1360
+    serverRoute: true
+    logLevel: debug
+
 tun:
   name: "hytun"
   mtu: 1500

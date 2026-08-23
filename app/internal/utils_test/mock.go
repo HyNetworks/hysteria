@@ -8,6 +8,8 @@ import (
 	"github.com/apernet/hysteria/core/v2/client"
 )
 
+var _ client.Client = (*MockEchoHyClient)(nil)
+
 type MockEchoHyClient struct{}
 
 func (c *MockEchoHyClient) TCP(addr string) (net.Conn, error) {
@@ -20,6 +22,14 @@ func (c *MockEchoHyClient) UDP() (client.HyUDPConn, error) {
 	return &mockEchoUDPConn{
 		BufChan: make(chan mockEchoUDPPacket, 10),
 	}, nil
+}
+
+func (c *MockEchoHyClient) PPP(dataStreams, maxFrameSize int) (*client.PPPConn, error) {
+	return nil, io.ErrClosedPipe
+}
+
+func (c *MockEchoHyClient) RemoteAddr() net.Addr {
+	return nil
 }
 
 func (c *MockEchoHyClient) Close() error {

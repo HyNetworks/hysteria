@@ -13,6 +13,7 @@ import (
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/pmtud"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
+	"github.com/apernet/hysteria/core/v2/ppp"
 	"github.com/apernet/quic-go"
 )
 
@@ -41,6 +42,7 @@ type Config struct {
 	EventLogger           EventLogger
 	TrafficLogger         TrafficLogger
 	MasqHandler           http.Handler
+	PPPRequestHandler     PPPRequestHandler // nil = PPP disabled
 }
 
 // fill fills the fields that are not set by the user with default values when possible,
@@ -235,6 +237,14 @@ type EventLogger interface {
 	TCPError(addr net.Addr, id, reqAddr string, err error)
 	UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string)
 	UDPError(addr net.Addr, id string, sessionID uint32, err error)
+}
+
+// PPPRequestHandler handles incoming PPP stream requests.
+// The control stream is already authenticated and the PPP request consumed (dataStreams extracted).
+// createDataIO must be called after writing the PPP response to activate data transport.
+// Implementation lives outside core (extras or app layer).
+type PPPRequestHandler interface {
+	HandlePPP(control io.ReadWriteCloser, params ppp.SessionParams, createDataIO func() (ppp.PPPDataIO, error), addr net.Addr, id string)
 }
 
 type HyStream interface {

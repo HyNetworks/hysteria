@@ -38,6 +38,7 @@ import (
 	"github.com/apernet/hysteria/app/v2/internal/url"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/client"
+	coreErrs "github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/realm"
@@ -92,6 +93,28 @@ type clientConfig struct {
 	UDPTProxy     *udpTProxyConfig       `mapstructure:"udpTProxy"`
 	TCPRedirect   *tcpRedirectConfig     `mapstructure:"tcpRedirect"`
 	TUN           *tunConfig             `mapstructure:"tun"`
+	PPP           *pppConfig             `mapstructure:"ppp"`
+}
+
+type pppSSTPConfig struct {
+	BinaryPath  string `mapstructure:"binaryPath"`
+	Listen      string `mapstructure:"listen"`
+	CertDir     string `mapstructure:"certDir"`
+	Endpoint    string `mapstructure:"endpoint"`
+	User        string `mapstructure:"user"`
+	Password    string `mapstructure:"password"`
+	MSSClamp    *int   `mapstructure:"mssClamp"` // nil=auto, 0=off, >0=forced
+	ServerRoute *bool  `mapstructure:"serverRoute"`
+	LogLevel    string `mapstructure:"logLevel"`
+}
+
+type pppConfig struct {
+	Mode        string         `mapstructure:"mode"`
+	MTU         uint32         `mapstructure:"mtu"`
+	PPPDPath    string         `mapstructure:"pppdPath"`
+	PPPDArgs    []string       `mapstructure:"pppdArgs"`
+	DataStreams int            `mapstructure:"dataStreams"`
+	SSTP        *pppSSTPConfig `mapstructure:"sstp"`
 }
 
 type mimicConfig struct {
@@ -644,6 +667,9 @@ func (c *clientConfig) Config() (*client.Config, error) {
 			return nil, err
 		}
 	}
+	if c.PPP != nil && c.PPP.DataStreams == 0 {
+		hyConfig.PPPMode = true
+	}
 	return hyConfig, nil
 }
 
@@ -836,12 +862,46 @@ func runClientCmd(cmd *cobra.Command, args []string) {
 	runClient(defaultViper)
 }
 
+// authRetryDelay is how long to wait before asking a second time about a refused
+// password. Short enough to stay inside the restart floor that is being spent
+// anyway, long enough to outlast the momentary gap it exists to tolerate.
+const authRetryDelay = 2 * time.Second
+
+// connectClient builds the client, and when the server refuses the password asks
+// once more before believing it.
+//
+// AuthError carries no more meaning than "the server answered with something
+// other than 233". A server whose auth backend is momentarily unavailable serves
+// the request through its masquerade handler instead -- a 404 -- which is the
+// same answer a genuinely wrong password gets, and the client cannot tell them
+// apart. With lazy off this handshake is a single un-retried attempt, and the
+// caller turns an AuthError into a status file that makes the netifd handler
+// call proto_block_restart. One unlucky moment would then hold the WAN down
+// until somebody logged in and ran ifup, where before it recovered by itself.
+//
+// Asking twice separates the two: a wrong password is refused both times, a gap
+// almost never lasts across the delay. Only an auth failure is retried -- every
+// other error is already treated as retryable and is left to netifd.
+func connectClient(config clientConfig, connected func(client.Client, *client.HandshakeInfo, int)) (client.Client, error) {
+	c, err := client.NewReconnectableClient(config.Config, connected, config.Lazy)
+	var authErr coreErrs.AuthError
+	if err == nil || !errors.As(err, &authErr) {
+		return c, err
+	}
+	logger.Warn("server refused the password, confirming before reporting it as final",
+		zap.Int("status", authErr.StatusCode))
+	time.Sleep(authRetryDelay)
+	return client.NewReconnectableClient(config.Config, connected, config.Lazy)
+}
+
 func runClient(v *viper.Viper) {
 	if err := v.ReadInConfig(); err != nil {
+		holdPPPRestart()
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
 	var config clientConfig
 	if err := v.Unmarshal(&config); err != nil {
+		holdPPPRestart()
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
 
@@ -851,20 +911,32 @@ func runClient(v *viper.Viper) {
 	mimicInst := config.startMimic()
 	defer mimicInst.Close()
 
-	c, err := client.NewReconnectableClient(
-		config.Config,
-		func(c client.Client, info *client.HandshakeInfo, count int) {
-			connectLog(info, count)
-			// On the client side, we start checking for updates after we successfully connect
-			// to the server, which, depending on whether lazy mode is enabled, may or may not
-			// be immediately after the client starts. We don't want the update check request
-			// to interfere with the lazy mode option.
-			if count == 1 && !disableUpdateCheck {
-				go runCheckUpdateClient(c)
-			}
-		}, config.Lazy,
-	)
+	connected := func(c client.Client, info *client.HandshakeInfo, count int) {
+		connectLog(info, count)
+		// On the client side, we start checking for updates after we successfully connect
+		// to the server, which, depending on whether lazy mode is enabled, may or may not
+		// be immediately after the client starts. We don't want the update check request
+		// to interfere with the lazy mode option.
+		if count == 1 && !disableUpdateCheck {
+			go runCheckUpdateClient(c)
+		}
+	}
+
+	c, err := connectClient(config, connected)
 	if err != nil {
+		// Two unrelated things share this line. The status write is where a
+		// refused Hysteria2 password is reported from: with lazy off the
+		// handshake has already happened here, so it never reaches the runner
+		// below. The hold is for the opposite case -- a dropped upstream fails
+		// this dial in microseconds, and without it that becomes a restart loop.
+		writePPPStatus(err)
+		// And the state file, which reports every failure rather than only the
+		// permanent ones. A handshake refused here never reaches PPP mode, so
+		// without this the link's last published state is whatever it was before
+		// the interface was rebuilt -- which for a link that was working a moment
+		// ago is "connected".
+		writePPPStateDown(err)
+		holdPPPRestart()
 		logger.Fatal("failed to initialize client", zap.Error(err))
 	}
 	defer c.Close()
@@ -919,6 +991,11 @@ func runClient(v *viper.Viper) {
 			return clientTUN(*config.TUN, c)
 		})
 	}
+	if config.PPP != nil {
+		runner.Add("PPP", func() error {
+			return clientPPP(*config.PPP, c, strings.EqualFold(config.Obfs.Type, "salamander"))
+		})
+	}
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
@@ -936,7 +1013,31 @@ func runClient(v *viper.Viper) {
 		if r.OK {
 			logger.Info(r.Msg)
 		} else {
+			// A connect that fails only reaches here in lazy mode, where the
+			// handshake is deferred until PPP mode asks for the conn. With lazy
+			// off -- which is what the OpenWrt handler generates, since it never
+			// writes the key -- the handshake has already happened above, and a
+			// refused password fails there instead. Both sites write the status.
+			writePPPStatus(r.Err)
+			writePPPStateDown(r.Err)
 			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
+			// Hand SIGTERM back to the runtime before holding. The deferred Stop
+			// never runs -- Fatal exits -- so without this an ifdown arriving
+			// during the hold would sit unread in signalChan and be ignored for
+			// the length of it, keeping netifd waiting on a process that has
+			// already decided to die.
+			signal.Stop(signalChan)
+			// Stop only restores the default disposition for signals still to
+			// come. One that arrived while this select was being decided is
+			// already buffered, and the select is free to have picked the runner
+			// case instead -- so it has to be looked for, not waited for. Finding
+			// one means an ifdown is in progress and nothing is going to restart
+			// us, which is exactly when holding is pure delay.
+			select {
+			case <-signalChan:
+			default:
+				holdPPPRestart()
+			}
 			if r.Err != nil {
 				logger.Fatal(r.Msg, zap.Error(r.Err))
 			} else {

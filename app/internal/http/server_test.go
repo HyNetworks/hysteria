@@ -31,6 +31,14 @@ func (c *mockHyClient) UDP() (client.HyUDPConn, error) {
 	return nil, errors.New("not implemented")
 }
 
+func (c *mockHyClient) PPP(dataStreams, maxFrameSize int) (*client.PPPConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *mockHyClient) RemoteAddr() net.Addr {
+	return nil
+}
+
 func (c *mockHyClient) Close() error {
 	return nil
 }

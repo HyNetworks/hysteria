@@ -13,6 +13,8 @@ import (
 
 const (
 	FrameTypeTCPRequest = 0x401
+	FrameTypePPPRequest = 0x402
+	FrameTypePPPData    = 0x403
 
 	// Max length values are for preventing DoS attacks
 
@@ -20,8 +22,12 @@ const (
 	MaxMessageLength = 2048
 	MaxPaddingLength = 4096
 
-	MaxDatagramFrameSize = 1200
-	MaxUDPSize           = 4096
+	MaxPPPDataStreams = 256
+
+	MaxDatagramFrameSize = 65535
+	// MaxPPPFrameSize bounds the advertised per-frame ceiling in the PPP handshake.
+	MaxPPPFrameSize = 65535
+	MaxUDPSize      = 4096
 
 	maxVarInt1 = 63
 	maxVarInt2 = 16383
@@ -142,6 +148,151 @@ func WriteTCPResponse(w io.Writer, ok bool, msg string) error {
 	}
 	i := varintPut(buf[1:], uint64(msgLen))
 	i += copy(buf[1+i:], msg)
+	i += varintPut(buf[1+i:], uint64(paddingLen))
+	copy(buf[1+i:], padding)
+	_, err := w.Write(buf)
+	return err
+}
+
+// PPPRequest format:
+// 0x402 (QUIC varint)
+// DataStreams (QUIC varint)
+// Padding length (QUIC varint)
+// Padding (bytes)
+
+// ReadPPPRequest returns the requested data stream count and the largest frame
+// the client's transport will carry. A zero maxFrameSize means the client did
+// not measure one.
+func ReadPPPRequest(r io.Reader) (dataStreams, maxFrameSize int, err error) {
+	bReader := quicvarint.NewReader(r)
+	ds, err := quicvarint.Read(bReader)
+	if err != nil {
+		return 0, 0, err
+	}
+	if ds > MaxPPPDataStreams {
+		return 0, 0, errors.ProtocolError{Message: "invalid dataStreams value"}
+	}
+	mfs, err := quicvarint.Read(bReader)
+	if err != nil {
+		return 0, 0, err
+	}
+	if mfs > MaxPPPFrameSize {
+		return 0, 0, errors.ProtocolError{Message: "invalid maxFrameSize value"}
+	}
+	paddingLen, err := quicvarint.Read(bReader)
+	if err != nil {
+		return 0, 0, err
+	}
+	if paddingLen > MaxPaddingLength {
+		return 0, 0, errors.ProtocolError{Message: "invalid padding length"}
+	}
+	if paddingLen > 0 {
+		if _, err = io.CopyN(io.Discard, r, int64(paddingLen)); err != nil {
+			return 0, 0, err
+		}
+	}
+	return int(ds), int(mfs), nil
+}
+
+// WritePPPRequest announces the data stream count and the client's measured
+// per-frame transport ceiling, so the server can size the PPP link to the
+// smaller of the two directions. Pass 0 if it is unknown.
+func WritePPPRequest(w io.Writer, dataStreams, maxFrameSize int) error {
+	padding := pppRequestPadding.String()
+	paddingLen := len(padding)
+	sz := int(quicvarint.Len(FrameTypePPPRequest)) +
+		int(quicvarint.Len(uint64(dataStreams))) +
+		int(quicvarint.Len(uint64(maxFrameSize))) +
+		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
+	buf := make([]byte, sz)
+	i := varintPut(buf, FrameTypePPPRequest)
+	i += varintPut(buf[i:], uint64(dataStreams))
+	i += varintPut(buf[i:], uint64(maxFrameSize))
+	i += varintPut(buf[i:], uint64(paddingLen))
+	copy(buf[i:], padding)
+	_, err := w.Write(buf)
+	return err
+}
+
+// PPPResponse format:
+// Status (byte, 0=ok, 1=error)
+// Message length (QUIC varint)
+// Message (bytes)
+// DataStreams (QUIC varint)
+// Padding length (QUIC varint)
+// Padding (bytes)
+
+// ReadPPPResponse also returns the PPP MTU the server settled on, or 0 if it
+// did not pick one.
+func ReadPPPResponse(r io.Reader) (ok bool, msg string, dataStreams, mtu int, err error) {
+	var status [1]byte
+	if _, err := io.ReadFull(r, status[:]); err != nil {
+		return false, "", 0, 0, err
+	}
+	bReader := quicvarint.NewReader(r)
+	msgLen, err := quicvarint.Read(bReader)
+	if err != nil {
+		return false, "", 0, 0, err
+	}
+	if msgLen > MaxMessageLength {
+		return false, "", 0, 0, errors.ProtocolError{Message: "invalid message length"}
+	}
+	var msgBuf []byte
+	if msgLen > 0 {
+		msgBuf = make([]byte, msgLen)
+		if _, err = io.ReadFull(r, msgBuf); err != nil {
+			return false, "", 0, 0, err
+		}
+	}
+	ds, err := quicvarint.Read(bReader)
+	if err != nil {
+		return false, "", 0, 0, err
+	}
+	if ds > MaxPPPDataStreams {
+		return false, "", 0, 0, errors.ProtocolError{Message: "invalid dataStreams value"}
+	}
+	rawMTU, err := quicvarint.Read(bReader)
+	if err != nil {
+		return false, "", 0, 0, err
+	}
+	if rawMTU > MaxPPPFrameSize {
+		return false, "", 0, 0, errors.ProtocolError{Message: "invalid mtu value"}
+	}
+	paddingLen, err := quicvarint.Read(bReader)
+	if err != nil {
+		return false, "", 0, 0, err
+	}
+	if paddingLen > MaxPaddingLength {
+		return false, "", 0, 0, errors.ProtocolError{Message: "invalid padding length"}
+	}
+	if paddingLen > 0 {
+		if _, err = io.CopyN(io.Discard, r, int64(paddingLen)); err != nil {
+			return false, "", 0, 0, err
+		}
+	}
+	return status[0] == 0, string(msgBuf), int(ds), int(rawMTU), nil
+}
+
+// WritePPPResponse reports the negotiated PPP MTU back to the client so it can
+// be logged and surfaced; pass 0 when none was computed.
+func WritePPPResponse(w io.Writer, ok bool, msg string, dataStreams, mtu int) error {
+	padding := pppResponsePadding.String()
+	paddingLen := len(padding)
+	msgLen := len(msg)
+	sz := 1 + int(quicvarint.Len(uint64(msgLen))) + msgLen +
+		int(quicvarint.Len(uint64(dataStreams))) +
+		int(quicvarint.Len(uint64(mtu))) +
+		int(quicvarint.Len(uint64(paddingLen))) + paddingLen
+	buf := make([]byte, sz)
+	if ok {
+		buf[0] = 0
+	} else {
+		buf[0] = 1
+	}
+	i := varintPut(buf[1:], uint64(msgLen))
+	i += copy(buf[1+i:], msg)
+	i += varintPut(buf[1+i:], uint64(dataStreams))
+	i += varintPut(buf[1+i:], uint64(mtu))
 	i += varintPut(buf[1+i:], uint64(paddingLen))
 	copy(buf[1+i:], padding)
 	_, err := w.Write(buf)
