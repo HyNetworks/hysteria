@@ -3,9 +3,13 @@ package masq
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,6 +72,89 @@ func TestRedirectHost(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, redirectHost(tt.host, tt.port))
 	}
+}
+
+func TestMasqTCPServerShutdownWaitsForRequestsAndClosesAllListeners(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	s := &MasqTCPServer{}
+
+	blockingListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	idleListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	serveErrors := make(chan error, 2)
+	go func() {
+		serveErrors <- s.serve(&http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			close(requestStarted)
+			<-releaseRequest
+			_, _ = io.WriteString(w, "finished")
+		})}, blockingListener, false)
+	}()
+	go func() {
+		serveErrors <- s.serve(&http.Server{Handler: http.NotFoundHandler()}, idleListener, false)
+	}()
+
+	responseDone := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + blockingListener.Addr().String())
+		if err != nil {
+			responseDone <- err
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err == nil && string(body) != "finished" {
+			err = errors.New("unexpected response body")
+		}
+		responseDone <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach the masquerade server")
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		shutdownDone <- s.Shutdown(ctx)
+	}()
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("tcp", idleListener.Addr().String(), 20*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return false
+		}
+		return true
+	}, time.Second, 10*time.Millisecond, "shutdown must close every listener promptly")
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before the in-flight request completed: %v", err)
+	default:
+	}
+
+	close(releaseRequest)
+	require.NoError(t, <-responseDone)
+	require.NoError(t, <-shutdownDone)
+	for range 2 {
+		assert.ErrorIs(t, <-serveErrors, http.ErrServerClosed)
+	}
+}
+
+func TestMasqTCPServerCannotRestartAfterShutdown(t *testing.T) {
+	t.Parallel()
+	s := &MasqTCPServer{}
+	require.NoError(t, s.Shutdown(context.Background()))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	err = s.serve(&http.Server{Handler: http.NotFoundHandler()}, listener, false)
+
+	assert.ErrorIs(t, err, http.ErrServerClosed)
+	_, err = net.DialTimeout("tcp", listener.Addr().String(), 20*time.Millisecond)
+	assert.Error(t, err, "a rejected listener must be closed")
 }
 
 type recordingResponseWriter struct {

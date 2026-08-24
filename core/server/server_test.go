@@ -2,6 +2,7 @@ package server
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type authenticatorFunc func(net.Addr, string, uint64) (bool, string)
+
+func (f authenticatorFunc) Authenticate(addr net.Addr, auth string, tx uint64) (bool, string) {
+	return f(addr, auth, tx)
+}
 
 func TestMasqHandlerStripsHysteriaProtocolHeaders(t *testing.T) {
 	t.Parallel()
@@ -41,4 +48,40 @@ func TestMasqHandlerStripsHysteriaProtocolHeaders(t *testing.T) {
 	assert.Equal(t, "backend body", body)
 	assert.Equal(t, "real secret", req.Header.Get(protocol.RequestHeaderAuth), "the caller's request must not be mutated")
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
+}
+
+func TestHandleAuthRequestReleasesLockBeforeMasquerade(t *testing.T) {
+	t.Parallel()
+	remoteAddr := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 12345}
+	h := &h3sHandler{config: &Config{
+		Authenticator: authenticatorFunc(func(addr net.Addr, auth string, tx uint64) (bool, string) {
+			assert.Equal(t, remoteAddr, addr)
+			assert.Equal(t, "invalid", auth)
+			return false, ""
+		}),
+	}}
+	req := httptest.NewRequest(http.MethodPost, "https://hysteria/auth", nil)
+	req.Header.Set(protocol.RequestHeaderAuth, "invalid")
+
+	handled := h.handleAuthRequest(httptest.NewRecorder(), req, remoteAddr)
+
+	assert.False(t, handled)
+	require.True(t, h.authMutex.TryLock(), "failed authentication must release the lock before proxying")
+	h.authMutex.Unlock()
+}
+
+func TestHandleAuthRequestReleasesLockOnPanic(t *testing.T) {
+	t.Parallel()
+	h := &h3sHandler{config: &Config{
+		Authenticator: authenticatorFunc(func(net.Addr, string, uint64) (bool, string) {
+			panic("authenticator panic")
+		}),
+	}}
+	req := httptest.NewRequest(http.MethodPost, "https://hysteria/auth", nil)
+
+	assert.Panics(t, func() {
+		h.handleAuthRequest(httptest.NewRecorder(), req, &net.TCPAddr{})
+	})
+	require.True(t, h.authMutex.TryLock(), "deferred unlock must run when an authenticator panics")
+	h.authMutex.Unlock()
 }

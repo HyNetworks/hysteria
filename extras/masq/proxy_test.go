@@ -213,6 +213,246 @@ func TestProxyHandlerClientCancellationReachesUpstream(t *testing.T) {
 	}
 }
 
+func TestProxyHandlerFlushIntervalStreamsKnownLengthResponse(t *testing.T) {
+	firstWritten := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "12")
+		_, _ = io.WriteString(w, "first\n")
+		w.(http.Flusher).Flush()
+		close(firstWritten)
+		<-release
+		_, _ = io.WriteString(w, "second")
+	}))
+	defer upstream.Close()
+
+	proxy, err := NewProxyHandler(ProxyOptions{URL: upstream.URL, FlushInterval: -time.Millisecond})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	frontend := httptest.NewServer(proxy)
+	defer frontend.Close()
+	defer close(release)
+
+	resp, err := frontend.Client().Get(frontend.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	select {
+	case <-firstWritten:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not write the first response chunk")
+	}
+	firstChunk := make(chan string, 1)
+	go func() {
+		buf := make([]byte, len("first\n"))
+		_, _ = io.ReadFull(resp.Body, buf)
+		firstChunk <- string(buf)
+	}()
+	select {
+	case chunk := <-firstChunk:
+		assert.Equal(t, "first\n", chunk)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("configured flush interval did not flush a known-length response")
+	}
+}
+
+func TestProxyHandlerStreamsRequestBody(t *testing.T) {
+	firstRead := make(chan string, 1)
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 5)
+		_, err := io.ReadFull(r.Body, buf)
+		if err != nil {
+			firstRead <- "read error: " + err.Error()
+			return
+		}
+		firstRead <- string(buf)
+		<-release
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, string(buf)+string(body))
+	}))
+	defer upstream.Close()
+
+	proxy, err := NewProxyHandler(ProxyOptions{URL: upstream.URL})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	frontend := httptest.NewServer(proxy)
+	defer frontend.Close()
+
+	reader, writer := io.Pipe()
+	req, err := http.NewRequest(http.MethodPost, frontend.URL, reader)
+	require.NoError(t, err)
+	req.ContentLength = 10
+	response := make(chan struct {
+		body string
+		err  error
+	}, 1)
+	go func() {
+		resp, err := frontend.Client().Do(req)
+		if err != nil {
+			response <- struct {
+				body string
+				err  error
+			}{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		response <- struct {
+			body string
+			err  error
+		}{body: string(body), err: err}
+	}()
+	_, err = writer.Write([]byte("first"))
+	require.NoError(t, err)
+	select {
+	case chunk := <-firstRead:
+		assert.Equal(t, "first", chunk, "upstream should receive data before the request body completes")
+	case <-time.After(time.Second):
+		t.Fatal("request body was buffered instead of streamed")
+	}
+	close(release)
+	_, err = writer.Write([]byte("last!"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	result := <-response
+	require.NoError(t, result.err)
+	assert.Equal(t, "firstlast!", result.body)
+}
+
+func TestProxyHandlerPreservesTrailers(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Trailer", "X-Checksum")
+		_, _ = io.WriteString(w, "payload")
+		w.Header().Set("X-Checksum", "complete")
+	}))
+	defer upstream.Close()
+	proxy, err := NewProxyHandler(ProxyOptions{URL: upstream.URL})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	frontend := httptest.NewServer(proxy)
+	defer frontend.Close()
+
+	resp, err := frontend.Client().Get(frontend.URL)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, "payload", string(body))
+	assert.Equal(t, "complete", resp.Trailer.Get("X-Checksum"))
+}
+
+func TestProxyHandlerPreservesHEADAndRangeSemantics(t *testing.T) {
+	const content = "0123456789"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "asset.txt", time.Unix(1, 0), strings.NewReader(content))
+	}))
+	defer upstream.Close()
+	proxy, err := NewProxyHandler(ProxyOptions{URL: upstream.URL})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	frontend := httptest.NewServer(proxy)
+	defer frontend.Close()
+
+	headReq, err := http.NewRequest(http.MethodHead, frontend.URL+"/asset.txt", nil)
+	require.NoError(t, err)
+	headResp, err := frontend.Client().Do(headReq)
+	require.NoError(t, err)
+	headBody, err := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, headResp.StatusCode)
+	assert.Empty(t, headBody)
+	assert.Equal(t, int64(len(content)), headResp.ContentLength)
+
+	rangeReq, err := http.NewRequest(http.MethodGet, frontend.URL+"/asset.txt", nil)
+	require.NoError(t, err)
+	rangeReq.Header.Set("Range", "bytes=2-5")
+	rangeResp, err := frontend.Client().Do(rangeReq)
+	require.NoError(t, err)
+	rangeBody, err := io.ReadAll(rangeResp.Body)
+	_ = rangeResp.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusPartialContent, rangeResp.StatusCode)
+	assert.Equal(t, "2345", string(rangeBody))
+	assert.Equal(t, "bytes 2-5/10", rangeResp.Header.Get("Content-Range"))
+}
+
+func TestProxyHandlerWebSocketUpgradeThroughAltSvcWriter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+		_ = rw.Flush()
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err == nil {
+			_, _ = conn.Write(buf)
+		}
+	}))
+	defer upstream.Close()
+	proxy, err := NewProxyHandler(ProxyOptions{URL: upstream.URL})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(newAltSvcHijackResponseWriter(w, 8443), r)
+	}))
+	defer frontend.Close()
+
+	conn, err := net.Dial("tcp", frontend.Listener.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "GET /socket HTTP/1.1\r\nHost: public.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+	require.NoError(t, err)
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	_, err = conn.Write([]byte("ping"))
+	require.NoError(t, err)
+	echo := make([]byte, 4)
+	_, err = io.ReadFull(reader, echo)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(echo))
+}
+
+func TestProxyHandlerBackendDisconnectReturnsBadGateway(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+	proxyErrors := make(chan error, 1)
+	proxy, err := NewProxyHandler(ProxyOptions{
+		URL: "http://" + listener.Addr().String(),
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			proxyErrors <- err
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	})
+	require.NoError(t, err)
+	defer proxy.CloseIdleConnections()
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://public.example/", nil))
+
+	assert.Equal(t, http.StatusBadGateway, recorder.Code)
+	select {
+	case err := <-proxyErrors:
+		assert.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("backend disconnect was not reported")
+	}
+}
+
 func TestProxyHandlerUnixSocket(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix sockets are not available on Windows")

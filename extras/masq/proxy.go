@@ -20,11 +20,12 @@ const (
 
 // ProxyOptions configures a single-upstream HTTP reverse proxy.
 type ProxyOptions struct {
-	URL          string
-	RewriteHost  bool
-	XForwarded   bool
-	Insecure     bool
-	ErrorHandler func(http.ResponseWriter, *http.Request, error)
+	URL           string
+	RewriteHost   bool
+	XForwarded    bool
+	Insecure      bool
+	FlushInterval time.Duration
+	ErrorHandler  func(http.ResponseWriter, *http.Request, error)
 }
 
 // ProxyHandler forwards HTTP requests to a single HTTP, HTTPS, or Unix socket
@@ -74,7 +75,8 @@ func NewProxyHandler(options ProxyOptions) (*ProxyHandler, error) {
 				r.SetXForwarded()
 			}
 		},
-		Transport: transport,
+		Transport:     transport,
+		FlushInterval: options.FlushInterval,
 		BufferPool: &proxyBufferPool{pool: sync.Pool{
 			New: func() any { return make([]byte, proxyBufferSize) },
 		}},
@@ -96,6 +98,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // CloseIdleConnections closes cached upstream connections.
 func (h *ProxyHandler) CloseIdleConnections() {
 	h.transport.CloseIdleConnections()
+}
+
+// Close implements io.Closer for integration with the server lifecycle.
+func (h *ProxyHandler) Close() error {
+	h.CloseIdleConnections()
+	return nil
 }
 
 func parseProxyTarget(rawURL string) (*url.URL, string, error) {

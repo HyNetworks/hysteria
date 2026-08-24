@@ -281,10 +281,11 @@ type serverConfigMasqueradeFile struct {
 }
 
 type serverConfigMasqueradeProxy struct {
-	URL         string `mapstructure:"url"`
-	RewriteHost bool   `mapstructure:"rewriteHost"`
-	XForwarded  bool   `mapstructure:"xForwarded"`
-	Insecure    bool   `mapstructure:"insecure"`
+	URL           string        `mapstructure:"url"`
+	RewriteHost   bool          `mapstructure:"rewriteHost"`
+	XForwarded    bool          `mapstructure:"xForwarded"`
+	Insecure      bool          `mapstructure:"insecure"`
+	FlushInterval time.Duration `mapstructure:"flushInterval"`
 }
 
 type serverConfigMasqueradeString struct {
@@ -1478,10 +1479,11 @@ func newMasqueradeProxyHandler(config serverConfigMasqueradeProxy) (http.Handler
 		return nil, errors.New("empty proxy url")
 	}
 	return masq.NewProxyHandler(masq.ProxyOptions{
-		URL:         config.URL,
-		RewriteHost: config.RewriteHost,
-		XForwarded:  config.XForwarded,
-		Insecure:    config.Insecure,
+		URL:           config.URL,
+		RewriteHost:   config.RewriteHost,
+		XForwarded:    config.XForwarded,
+		Insecure:      config.Insecure,
+		FlushInterval: config.FlushInterval,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("HTTP reverse proxy error", zap.Error(err))
 			w.WriteHeader(http.StatusBadGateway)
@@ -1534,6 +1536,7 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 	}
 	hyConfig.MasqHandler = &masqHandlerLogWrapper{H: handler, QUIC: true}
 
+	var tcpServer *masq.MasqTCPServer
 	if c.Masquerade.ListenHTTP != "" || c.Masquerade.ListenHTTPS != "" {
 		if c.Masquerade.ListenHTTP != "" && c.Masquerade.ListenHTTPS == "" {
 			return configError{Field: "masquerade.listenHTTPS", Err: errors.New("having only HTTP server without HTTPS is not supported")}
@@ -1542,7 +1545,7 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		if err != nil {
 			return configError{Field: "masquerade.advertisedQUICPort", Err: err}
 		}
-		s := masq.MasqTCPServer{
+		tcpServer = &masq.MasqTCPServer{
 			QUICPort:  quicPort,
 			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
 			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
@@ -1553,9 +1556,38 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}
-		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
+	}
+
+	closers := make(orderedClosers, 0, 3)
+	if tcpServer != nil {
+		closers = append(closers, tcpServer)
+	}
+	if closer, ok := handler.(io.Closer); ok {
+		closers = append(closers, closer)
+	}
+	if len(closers) > 0 {
+		if hyConfig.Cleanup != nil {
+			closers = append(closers, hyConfig.Cleanup)
+		}
+		hyConfig.Cleanup = closers
+	}
+	if tcpServer != nil {
+		go runMasqTCPServer(tcpServer, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
 	}
 	return nil
+}
+
+// orderedClosers shuts down dependants before the resources they use. In the
+// masquerade case this means listeners first, the upstream transport second,
+// and the pre-existing packet-connection runtime last.
+type orderedClosers []io.Closer
+
+func (c orderedClosers) Close() error {
+	var err error
+	for _, closer := range c {
+		err = errors.Join(err, closer.Close())
+	}
+	return err
 }
 
 // Config validates the fields and returns a ready-to-use Hysteria server config
@@ -1681,7 +1713,7 @@ func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
 		}()
 	}
 	err := <-errChan
-	if err != nil {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal("failed to serve masquerade HTTP(S)", zap.Error(err))
 	}
 }

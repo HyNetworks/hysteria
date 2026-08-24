@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"math/rand"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -162,82 +163,93 @@ func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
 
 func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
-		h.authMutex.Lock()
-		if h.authenticated {
-			// Already authenticated
-			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
-				UDPEnabled: !h.config.DisableUDP,
-				Rx:         h.config.BandwidthConfig.MaxRx,
-				RxAuto:     h.config.IgnoreClientBandwidth,
-			})
-			w.WriteHeader(protocol.StatusAuthOK)
-			h.authMutex.Unlock()
+		if h.handleAuthRequest(w, r, h.conn.RemoteAddr()) {
 			return
 		}
-		authReq := protocol.AuthRequestFromHeader(r.Header)
-		actualTx := authReq.Rx
-		ok, id := h.config.Authenticator.Authenticate(h.conn.RemoteAddr(), authReq.Auth, actualTx)
-		if ok {
-			// Set authenticated flag
-			h.authenticated = true
-			h.authID = id
-			if h.config.IgnoreClientBandwidth {
-				// Ignore client bandwidth and use the configured congestion controller.
-				congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
-				actualTx = 0
-			} else {
-				// actualTx = min(serverTx, clientRx)
-				if h.config.BandwidthConfig.MaxTx > 0 && actualTx > h.config.BandwidthConfig.MaxTx {
-					// We have a maxTx limit and the client is asking for more than that,
-					// return and use the limit instead
-					actualTx = h.config.BandwidthConfig.MaxTx
-				}
-				if actualTx > 0 {
-					congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
-				} else {
-					// Client doesn't know its own bandwidth, use the configured congestion controller.
-					congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
-				}
-			}
-			// Auth OK, send response
-			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
-				UDPEnabled: !h.config.DisableUDP,
-				Rx:         h.config.BandwidthConfig.MaxRx,
-				RxAuto:     h.config.IgnoreClientBandwidth,
-			})
-			w.WriteHeader(protocol.StatusAuthOK)
-			// Call event logger
-			if tl := h.config.TrafficLogger; tl != nil {
-				tl.LogOnlineState(id, true)
-			}
-			if el := h.config.EventLogger; el != nil {
-				el.Connect(h.conn.RemoteAddr(), id, actualTx)
-			}
-			// Initialize UDP session manager (if UDP is enabled)
-			// We use sync.Once to make sure that only one goroutine is started,
-			// as ServeHTTP may be called by multiple goroutines simultaneously
-			if !h.config.DisableUDP {
-				go func() {
-					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
-						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
-						h.config.UDPIdleTimeout,
-					)
-					h.udpSM = sm
-					go sm.Run()
-				}()
-			}
-			h.authMutex.Unlock()
-		} else {
-			// Auth failed. Release the authentication lock before invoking an
-			// arbitrary backend handler, which may stream for an unbounded time.
-			h.authMutex.Unlock()
-			h.masqHandler(w, r)
-		}
+		// Authentication failed. handleAuthRequest has already left the
+		// authentication critical section, so an arbitrary backend response can
+		// stream for as long as needed without blocking another auth attempt.
+		h.masqHandler(w, r)
 	} else {
 		// Not an auth request, pretend to be a normal HTTP server
 		h.masqHandler(w, r)
 	}
+}
+
+// handleAuthRequest serializes authentication state changes. It returns true
+// when the request was handled as Hysteria traffic and false when it should be
+// forwarded to the masquerade handler.
+func (h *h3sHandler) handleAuthRequest(w http.ResponseWriter, r *http.Request, remoteAddr net.Addr) bool {
+	h.authMutex.Lock()
+	defer h.authMutex.Unlock()
+
+	if h.authenticated {
+		// Already authenticated
+		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
+			UDPEnabled: !h.config.DisableUDP,
+			Rx:         h.config.BandwidthConfig.MaxRx,
+			RxAuto:     h.config.IgnoreClientBandwidth,
+		})
+		w.WriteHeader(protocol.StatusAuthOK)
+		return true
+	}
+	authReq := protocol.AuthRequestFromHeader(r.Header)
+	actualTx := authReq.Rx
+	ok, id := h.config.Authenticator.Authenticate(remoteAddr, authReq.Auth, actualTx)
+	if !ok {
+		return false
+	}
+
+	// Set authenticated flag
+	h.authenticated = true
+	h.authID = id
+	if h.config.IgnoreClientBandwidth {
+		// Ignore client bandwidth and use the configured congestion controller.
+		congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
+		actualTx = 0
+	} else {
+		// actualTx = min(serverTx, clientRx)
+		if h.config.BandwidthConfig.MaxTx > 0 && actualTx > h.config.BandwidthConfig.MaxTx {
+			// We have a maxTx limit and the client is asking for more than that,
+			// return and use the limit instead
+			actualTx = h.config.BandwidthConfig.MaxTx
+		}
+		if actualTx > 0 {
+			congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
+		} else {
+			// Client doesn't know its own bandwidth, use the configured congestion controller.
+			congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
+		}
+	}
+	// Auth OK, send response
+	protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
+		UDPEnabled: !h.config.DisableUDP,
+		Rx:         h.config.BandwidthConfig.MaxRx,
+		RxAuto:     h.config.IgnoreClientBandwidth,
+	})
+	w.WriteHeader(protocol.StatusAuthOK)
+	// Call event logger
+	if tl := h.config.TrafficLogger; tl != nil {
+		tl.LogOnlineState(id, true)
+	}
+	if el := h.config.EventLogger; el != nil {
+		el.Connect(remoteAddr, id, actualTx)
+	}
+	// Initialize UDP session manager (if UDP is enabled)
+	// The authentication mutex makes sure that only one goroutine is started,
+	// as ServeHTTP may be called by multiple goroutines simultaneously.
+	if !h.config.DisableUDP {
+		go func() {
+			sm := newUDPSessionManager(
+				&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+				&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
+				h.config.UDPIdleTimeout,
+			)
+			h.udpSM = sm
+			go sm.Run()
+		}()
+	}
+	return true
 }
 
 func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
