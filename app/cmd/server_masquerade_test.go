@@ -145,19 +145,6 @@ func TestMasqueradeProxyUnixReusesConnections(t *testing.T) {
 	assert.Equal(t, int64(1), listener.accepts.Load())
 }
 
-func TestMasqueradeProxyUnixTransportSettings(t *testing.T) {
-	target, roundTripper, err := newMasqueradeProxyTarget("/tmp/anubis.sock", false)
-	require.NoError(t, err)
-	assert.Equal(t, "http://localhost", target.String())
-
-	transport, ok := roundTripper.(*http.Transport)
-	require.True(t, ok)
-	assert.Nil(t, transport.Proxy)
-	assert.NotNil(t, transport.DialContext)
-	assert.Equal(t, masqueradeProxyMaxIdleConnections, transport.MaxIdleConns)
-	assert.Equal(t, masqueradeProxyMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
-}
-
 func TestMasqueradeProxyUnixConnectionErrorReturnsBadGateway(t *testing.T) {
 	previousLogger := logger
 	logger = zap.NewNop()

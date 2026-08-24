@@ -163,7 +163,6 @@ func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
 func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
 		h.authMutex.Lock()
-		defer h.authMutex.Unlock()
 		if h.authenticated {
 			// Already authenticated
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
@@ -172,6 +171,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				RxAuto:     h.config.IgnoreClientBandwidth,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
+			h.authMutex.Unlock()
 			return
 		}
 		authReq := protocol.AuthRequestFromHeader(r.Header)
@@ -227,8 +227,11 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					go sm.Run()
 				}()
 			}
+			h.authMutex.Unlock()
 		} else {
-			// Auth failed, pretend to be a normal HTTP server
+			// Auth failed. Release the authentication lock before invoking an
+			// arbitrary backend handler, which may stream for an unbounded time.
+			h.authMutex.Unlock()
 			h.masqHandler(w, r)
 		}
 	} else {
@@ -349,6 +352,12 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 
 func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
 	if h.config.MasqHandler != nil {
+		// Protocol metadata is internal to Hysteria and must never reach the
+		// decoy backend, especially when an authentication request fails.
+		r = r.Clone(r.Context())
+		r.Header.Del(protocol.RequestHeaderAuth)
+		r.Header.Del(protocol.CommonHeaderCCRX)
+		r.Header.Del(protocol.CommonHeaderPadding)
 		h.config.MasqHandler.ServeHTTP(w, r)
 	} else {
 		// Return 404 for everything

@@ -223,9 +223,10 @@ func TestServerConfig(t *testing.T) {
 				},
 				StatusCode: 418,
 			},
-			ListenHTTP:  ":80",
-			ListenHTTPS: ":443",
-			ForceHTTPS:  true,
+			ListenHTTP:         ":80",
+			ListenHTTPS:        ":443",
+			ForceHTTPS:         true,
+			AdvertisedQUICPort: 8443,
 		},
 	})
 }
@@ -306,6 +307,24 @@ func TestParseServerRealmAddr(t *testing.T) {
 	_, ok, err = parseServerRealmAddr("realm://example.com/realm")
 	assert.True(t, ok)
 	assert.Error(t, err)
+}
+
+func TestAdvertisedQUICPort(t *testing.T) {
+	t.Parallel()
+
+	port, err := advertisedQUICPort(0, "127.0.0.1:8443")
+	assert.NoError(t, err)
+	assert.Equal(t, 8443, port)
+
+	port, err = advertisedQUICPort(443, "127.0.0.1:8443")
+	assert.NoError(t, err)
+	assert.Equal(t, 443, port)
+
+	_, err = advertisedQUICPort(-1, "127.0.0.1:8443")
+	assert.EqualError(t, err, "port must be between 1 and 65535")
+
+	_, err = advertisedQUICPort(65536, "127.0.0.1:8443")
+	assert.EqualError(t, err, "port must be between 1 and 65535")
 }
 
 func TestServerRealmSTUNServers(t *testing.T) {

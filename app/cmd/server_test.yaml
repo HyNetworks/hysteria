@@ -180,3 +180,4 @@ masquerade:
   listenHTTP: :80
   listenHTTPS: :443
   forceHTTPS: true
+  advertisedQUICPort: 8443
