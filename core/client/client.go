@@ -287,6 +287,10 @@ func (c *tcpConn) Write(b []byte) (n int, err error) {
 	return c.Orig.Write(b)
 }
 
+func (c *tcpConn) CloseWrite() error {
+	return c.Orig.CloseWrite()
+}
+
 func (c *tcpConn) Close() error {
 	return c.Orig.Close()
 }

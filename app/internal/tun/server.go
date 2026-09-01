@@ -100,6 +100,15 @@ type tunHandler struct {
 	*Server
 }
 
+type copyResult struct {
+	err        error
+	halfClosed bool
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
 var _ tun.Handler = (*tunHandler)(nil)
 
 func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadata.Metadata) error {
@@ -123,20 +132,72 @@ func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadat
 	defer rc.Close()
 
 	// start forwarding
-	copyErrChan := make(chan error, 2)
+	copyResultChan := make(chan copyResult, 2)
+
+	// local -> remote
 	go func() {
 		_, copyErr := io.Copy(rc, conn)
-		copyErrChan <- copyErr
+		if copyErr != nil {
+			copyResultChan <- copyResult{err: copyErr}
+			return
+		}
+
+		cw, ok := rc.(closeWriter)
+		if !ok {
+			copyResultChan <- copyResult{}
+			return
+		}
+
+		copyErr = cw.CloseWrite()
+		copyResultChan <- copyResult{
+			err:        copyErr,
+			halfClosed: copyErr == nil,
+		}
 	}()
+
+	// remote -> local
 	go func() {
 		_, copyErr := io.Copy(conn, rc)
-		copyErrChan <- copyErr
+		if copyErr != nil {
+			copyResultChan <- copyResult{err: copyErr}
+			return
+		}
+
+		cw, ok := conn.(closeWriter)
+		if !ok {
+			copyResultChan <- copyResult{}
+			return
+		}
+
+		copyErr = cw.CloseWrite()
+		copyResultChan <- copyResult{
+			err:        copyErr,
+			halfClosed: copyErr == nil,
+		}
 	}()
+
+	// Wait for the first direction to finish.
 	select {
 	case <-ctx.Done():
 		closeErr = ctx.Err()
-	case closeErr = <-copyErrChan:
+		return nil
+
+	case result := <-copyResultChan:
+		closeErr = result.err
+		if closeErr != nil || !result.halfClosed {
+			return nil
+		}
 	}
+
+	// A successful half-close preserves the opposite direction.
+	select {
+	case <-ctx.Done():
+		closeErr = ctx.Err()
+
+	case result := <-copyResultChan:
+		closeErr = result.err
+	}
+
 	return nil
 }
 

@@ -45,6 +45,10 @@ func (s *QStream) Close() error {
 	return s.Stream.Close()
 }
 
+func (s *QStream) CloseWrite() error {
+	return s.Stream.Close()
+}
+
 func (s *QStream) CancelWrite(code quic.StreamErrorCode) {
 	s.Stream.CancelWrite(code)
 }
