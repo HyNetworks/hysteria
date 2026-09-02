@@ -49,6 +49,7 @@ quic:
   keepAlivePeriod: 4s
   disablePathMTUDiscovery: true
   disableChromeParrot: true
+  version: v2
   sockopts:
     bindInterface: eth0
     fwmark: 1234

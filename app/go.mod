@@ -8,6 +8,7 @@ require (
 	github.com/apernet/go-tproxy v0.0.0-20230809025308-8f4723fd742f
 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
 	github.com/apernet/hysteria/extras/v2 v2.0.0-00010101000000-000000000000
+	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/apernet/sing-tun v0.2.6-0.20250920121535-299f04629986
 	github.com/caddyserver/certmagic v0.25.4
 	github.com/libdns/cloudflare v0.2.2
@@ -33,7 +34,6 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
-	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
 	github.com/database64128/tfo-go/v2 v2.3.3 // indirect
