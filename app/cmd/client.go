@@ -42,6 +42,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/realm"
 	"github.com/apernet/hysteria/extras/v2/transport/udphop"
+	"github.com/apernet/quic-go"
 )
 
 // Ref: https://ip.skk.moe/stun
@@ -170,6 +171,7 @@ type clientConfigQUIC struct {
 	KeepAlivePeriod             time.Duration            `mapstructure:"keepAlivePeriod"`
 	DisablePathMTUDiscovery     bool                     `mapstructure:"disablePathMTUDiscovery"`
 	DisableChromeParrot         bool                     `mapstructure:"disableChromeParrot"`
+	Version                     string                   `mapstructure:"version"`
 	Sockopts                    clientConfigQUICSockopts `mapstructure:"sockopts"`
 }
 
@@ -459,7 +461,21 @@ func (c *clientConfig) validateMimic() error {
 }
 
 func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
+	var version quic.Version
+	switch c.QUIC.Version {
+	case "":
+	case "v1":
+		version = quic.Version1
+	case "v2":
+		version = quic.Version2
+		if !c.QUIC.DisableChromeParrot {
+			logger.Warn("Chrome parrot is disabled when using QUIC v2")
+		}
+	default:
+		return configError{Field: "quic.version", Err: errors.New("must be v1 or v2")}
+	}
 	hyConfig.QUICConfig = client.QUICConfig{
+		Version:                        version,
 		InitialStreamReceiveWindow:     c.QUIC.InitStreamReceiveWindow,
 		MaxStreamReceiveWindow:         c.QUIC.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: c.QUIC.InitConnectionReceiveWindow,
