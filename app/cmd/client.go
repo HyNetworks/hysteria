@@ -879,6 +879,10 @@ func runClient(v *viper.Viper) {
 
 	// Register modes
 	var runner clientModeRunner
+	var tunDone <-chan struct{}
+
+	tunCtx, cancelTun := context.WithCancel(context.Background())
+	defer cancelTun()
 	if config.SOCKS5 != nil {
 		runner.Add("SOCKS5 server", func() error {
 			return clientSOCKS5(*config.SOCKS5, c)
@@ -915,9 +919,14 @@ func runClient(v *viper.Viper) {
 		})
 	}
 	if config.TUN != nil {
+		done := make(chan struct{})
+		tunDone = done
+
 		runner.Add("TUN", func() error {
-			return clientTUN(*config.TUN, c)
+			defer close(done)
+			return clientTUN(tunCtx, *config.TUN, c)
 		})
+
 	}
 
 	signalChan := make(chan os.Signal, 1)
@@ -932,11 +941,20 @@ func runClient(v *viper.Viper) {
 	select {
 	case <-signalChan:
 		logger.Info("received signal, shutting down gracefully")
+		cancelTun()
+		if tunDone != nil {
+			<-tunDone
+		}
 	case r := <-runnerChan:
 		if r.OK {
 			logger.Info(r.Msg)
 		} else {
-			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
+			cancelTun()
+
+			if tunDone != nil {
+				<-tunDone
+			}
+			_ = c.Close()
 			if r.Err != nil {
 				logger.Fatal(r.Msg, zap.Error(r.Err))
 			} else {
@@ -1149,7 +1167,7 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
 	return p.ListenAndServe(laddr)
 }
 
-func clientTUN(config tunConfig, c client.Client) error {
+func clientTUN(ctx context.Context, config tunConfig, c client.Client) error {
 	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
 	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
 		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
@@ -1232,7 +1250,7 @@ func clientTUN(config tunConfig, c client.Client) error {
 		}
 	}
 	logger.Info("TUN listening", zap.String("interface", config.Name))
-	return server.Serve()
+	return server.Serve(ctx)
 }
 
 // parseServerAddrString parses server address string.
