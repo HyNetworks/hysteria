@@ -9,6 +9,7 @@ import (
 	"github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/pmtud"
+	"github.com/apernet/quic-go"
 )
 
 const (
@@ -74,6 +75,13 @@ func (c *Config) verifyAndFill() error {
 		return errors.ConfigError{Field: "QUICConfig.KeepAlivePeriod", Reason: "must be between 2s and 60s"}
 	}
 	c.QUICConfig.DisablePathMTUDiscovery = c.QUICConfig.DisablePathMTUDiscovery || pmtud.DisablePathMTUDiscovery
+	if v := c.QUICConfig.Version; v != 0 && v != quic.Version1 && v != quic.Version2 {
+		return errors.ConfigError{Field: "QUICConfig.Version", Reason: "must be v1 or v2"}
+	}
+	if c.QUICConfig.Version == quic.Version2 {
+		// The parrot advertises v1 in version_information, and Chrome never offers v2.
+		c.QUICConfig.DisableChromeParrot = true
+	}
 	var err error
 	c.CongestionConfig.Type, err = congestion.NormalizeType(c.CongestionConfig.Type)
 	if err != nil {
@@ -120,7 +128,8 @@ type QUICConfig struct {
 	KeepAlivePeriod                time.Duration
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
 	DisableGSO                     bool
-	DisableChromeParrot            bool // Chrome QUIC fingerprint parroting is on by default.
+	DisableChromeParrot            bool         // Chrome QUIC fingerprint parroting is on by default.
+	Version                        quic.Version // v1 or v2. Zero = quic-go default (v1).
 }
 
 type CongestionConfig struct {

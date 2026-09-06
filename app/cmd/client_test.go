@@ -73,6 +73,7 @@ func TestClientConfig(t *testing.T) {
 			KeepAlivePeriod:             4 * time.Second,
 			DisablePathMTUDiscovery:     true,
 			DisableChromeParrot:         true,
+			Version:                     "v2",
 			Sockopts: clientConfigQUICSockopts{
 				BindInterface:       stringRef("eth0"),
 				FirewallMark:        uint32Ref(1234),
