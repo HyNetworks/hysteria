@@ -2,6 +2,8 @@ package utils
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -46,7 +48,16 @@ func (s *QStream) Close() error {
 }
 
 func (s *QStream) CloseWrite() error {
-	return s.Stream.Close()
+	err := s.Stream.Close()
+	if err != nil {
+		// Close reports cancellation as a plain error. Preserve the typed cause
+		// so callers can distinguish a canceled direction from other failures.
+		var streamErr *quic.StreamError
+		if errors.As(context.Cause(s.Stream.Context()), &streamErr) {
+			return fmt.Errorf("%w: %w", err, streamErr)
+		}
+	}
+	return err
 }
 
 func (s *QStream) CancelWrite(code quic.StreamErrorCode) {
