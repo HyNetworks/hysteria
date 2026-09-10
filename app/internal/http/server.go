@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	httpClientTimeout = 10 * time.Second
+	httpResponseHeaderTimeout = 10 * time.Second
 )
 
 // Server is an HTTP server using a Hysteria client as outbound.
@@ -235,11 +235,11 @@ func (s *Server) initHTTPClient() {
 				// HyClient doesn't support context for now
 				return s.HyClient.TCP(addr)
 			},
+			ResponseHeaderTimeout: httpResponseHeaderTimeout,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: httpClientTimeout,
 	}
 }
 
