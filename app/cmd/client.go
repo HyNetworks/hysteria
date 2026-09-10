@@ -195,6 +195,11 @@ type socks5Config struct {
 	Username   string `mapstructure:"username"`
 	Password   string `mapstructure:"password"`
 	DisableUDP bool   `mapstructure:"disableUDP"`
+	// Timeout is the idle timeout of a UDP association. Zero uses the default.
+	// Named `timeout` to match udpTProxyConfig, udpRedirectConfig and tunConfig,
+	// which spell the same knob that way — tunConfig included, which likewise
+	// carries both TCP and UDP and still calls it `timeout`.
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 type httpConfig struct {
@@ -1011,6 +1016,7 @@ func clientSOCKS5(config socks5Config, c client.Client) error {
 		HyClient:    c,
 		AuthFunc:    authFunc,
 		DisableUDP:  config.DisableUDP,
+		UDPTimeout:  config.Timeout,
 		EventLogger: &socks5Logger{},
 	}
 	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
