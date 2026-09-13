@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // --- in-memory packet pipe ---
@@ -486,6 +488,9 @@ func TestGeckoUDPPassthrough(t *testing.T) {
 		SyscallConn() (syscall.RawConn, error)
 		SetReadBuffer(int) error
 		SetWriteBuffer(int) error
+		ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+		WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+		ReadBatch([]ipv4.Message, int) (int, error)
 	}
 	u, ok := g.(udpLike)
 	if !ok {
@@ -561,6 +566,10 @@ func TestGeckoPaddingWithinBounds(t *testing.T) {
 var (
 	_ net.PacketConn    = (*geckoPacketConn)(nil)
 	_ udpLikePacketConn = (*geckoPacketConn)(nil)
+	_ interface {
+		oobCapablePacketConn
+		ReadBatch([]ipv4.Message, int) (int, error)
+	} = (*geckoPacketConnOOB)(nil)
 )
 
 // Sanity: errors.ErrUnsupported is what we return when inner isn't UDP-like.
