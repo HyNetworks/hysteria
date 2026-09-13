@@ -285,12 +285,16 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 	case "", "udp":
 		if hyConfig.ServerAddr.Network() == "udphop" {
 			hopAddr := hyConfig.ServerAddr.(*udphop.UDPHopAddr)
+			network := udpNetworkFromAddr(hopAddr)
 			openInner = func() (net.PacketConn, error) {
-				return udphop.NewUDPHopPacketConn(hopAddr, hopInterval, so.ListenUDP)
+				return udphop.NewUDPHopPacketConn(hopAddr, hopInterval, func() (net.PacketConn, error) {
+					return so.ListenUDPAddrNetwork(network, nil)
+				})
 			}
 		} else {
+			network := udpNetworkFromAddr(hyConfig.ServerAddr)
 			openInner = func() (net.PacketConn, error) {
-				return so.ListenUDP()
+				return so.ListenUDPAddrNetwork(network, nil)
 			}
 		}
 	default:
@@ -1330,6 +1334,32 @@ func punchPacketTypeString(t realm.PunchPacketType) string {
 
 func formatLogDuration(d time.Duration) string {
 	return d.Round(time.Millisecond).String()
+}
+
+// udpNetworkFromAddr returns "udp4" for IPv4, "udp6" for IPv6, "udp" otherwise.
+// This ensures an AF_INET socket is used on IPv4-only interfaces (e.g. Linux GRE tunnels),
+// which silently drop packets from AF_INET6 dual-stack sockets.
+func udpNetworkFromAddr(addr net.Addr) string {
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a != nil {
+			ip = a.IP
+		}
+	case *udphop.UDPHopAddr:
+		if a != nil {
+			ip = a.IP
+		}
+	default:
+		return "udp"
+	}
+	if ip.To4() != nil {
+		return "udp4"
+	}
+	if len(ip) > 0 {
+		return "udp6"
+	}
+	return "udp"
 }
 
 func connectLog(info *client.HandshakeInfo, count int) {
