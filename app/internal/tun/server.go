@@ -2,11 +2,14 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"time"
 
+	"github.com/apernet/quic-go"
 	tun "github.com/apernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -100,6 +103,30 @@ type tunHandler struct {
 	*Server
 }
 
+type copyResult struct {
+	err          error
+	waitForOther bool
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func isRemoteStreamCancellation(err error) bool {
+	var streamErr *quic.StreamError
+	return errors.As(err, &streamErr) && streamErr.Remote
+}
+
+func closeWriteResult(conn net.Conn) copyResult {
+	cw, ok := conn.(closeWriter)
+	if !ok {
+		return copyResult{}
+	}
+	err := cw.CloseWrite()
+	// A peer canceling its receive direction does not close its send direction.
+	return copyResult{err: err, waitForOther: err == nil || isRemoteStreamCancellation(err)}
+}
+
 var _ tun.Handler = (*tunHandler)(nil)
 
 func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadata.Metadata) error {
@@ -123,20 +150,72 @@ func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadat
 	defer rc.Close()
 
 	// start forwarding
-	copyErrChan := make(chan error, 2)
+	copyResultChan := make(chan copyResult, 2)
+	// local -> remote
 	go func() {
 		_, copyErr := io.Copy(rc, conn)
-		copyErrChan <- copyErr
+
+		if copyErr != nil {
+			copyResultChan <- copyResult{err: copyErr, waitForOther: isRemoteStreamCancellation(copyErr)}
+			return
+		}
+
+		copyResultChan <- closeWriteResult(rc)
 	}()
+	// remote -> local
 	go func() {
 		_, copyErr := io.Copy(conn, rc)
-		copyErrChan <- copyErr
+
+		if copyErr != nil {
+			copyResultChan <- copyResult{err: copyErr}
+			return
+		}
+		copyResultChan <- closeWriteResult(conn)
 	}()
+	completed := 0
+	defer func() {
+		if completed == 2 {
+			return
+		}
+
+		// Interrupt pending I/O and join both copies before deferred rc.Close.
+		// QUIC's graceful stream Close must not run concurrently with Write.
+		now := time.Now()
+		_ = conn.SetDeadline(now)
+		_ = rc.SetDeadline(now)
+
+		for completed < 2 {
+			<-copyResultChan
+			completed++
+		}
+	}()
+	// Wait for the first direction to finish.
 	select {
 	case <-ctx.Done():
 		closeErr = ctx.Err()
-	case closeErr = <-copyErrChan:
+		return nil
+
+	case result := <-copyResultChan:
+		completed++
+		closeErr = result.err
+		if !result.waitForOther {
+			return nil
+		}
 	}
+
+	// A half-close or peer cancellation preserves the opposite direction.
+	select {
+	case <-ctx.Done():
+		closeErr = ctx.Err()
+
+	case result := <-copyResultChan:
+		completed++
+		// Retain a first-direction close error when the second completes cleanly.
+		if result.err != nil {
+			closeErr = result.err
+		}
+	}
+
 	return nil
 }
 
