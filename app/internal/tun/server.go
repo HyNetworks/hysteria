@@ -2,10 +2,12 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 
 	tun "github.com/apernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
@@ -48,7 +50,7 @@ type EventLogger interface {
 	UDPError(addr string, err error)
 }
 
-func (s *Server) Serve() error {
+func (s *Server) Serve(ctx context.Context) error {
 	if !isIPv6Supported() {
 		s.Logger.Warn("tun-pre-check", zap.String("msg", "IPv6 is not supported or enabled on this system, TUN device is created without IPv6 support."))
 		s.Inet6Address = nil
@@ -74,14 +76,23 @@ func (s *Server) Serve() error {
 	if err != nil {
 		return fmt.Errorf("failed to create tun interface: %w", err)
 	}
-	defer tunIf.Close()
+	var closeTunOnce sync.Once
 
+	closeTun := func() {
+		closeTunOnce.Do(func() {
+			_ = tunIf.Close()
+		})
+	}
+	defer closeTun()
 	tunStack, err := tun.NewSystem(tun.StackOptions{
-		Context:    context.Background(),
+		Context:    ctx,
 		Tun:        tunIf,
 		TunOptions: tunOpts,
 		UDPTimeout: s.Timeout,
-		Handler:    &tunHandler{s},
+		Handler: &tunHandler{
+			Server:      s,
+			shutdownCtx: ctx,
+		},
 		Logger: &singLogger{
 			tag:       "tun-stack",
 			zapLogger: s.Logger,
@@ -93,11 +104,25 @@ func (s *Server) Serve() error {
 		return fmt.Errorf("failed to create tun stack: %w", err)
 	}
 	defer tunStack.Close()
-	return tunStack.(tun.StackRunner).Run()
+
+	stopClose := context.AfterFunc(ctx, closeTun)
+	defer stopClose()
+	err = tunStack.(tun.StackRunner).Run()
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	return err
 }
 
 type tunHandler struct {
 	*Server
+	shutdownCtx context.Context
+}
+
+func (t *tunHandler) isShutdownCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) &&
+		errors.Is(t.shutdownCtx.Err(), context.Canceled)
 }
 
 var _ tun.Handler = (*tunHandler)(nil)
@@ -110,10 +135,11 @@ func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadat
 	}
 	var closeErr error
 	defer func() {
-		if t.EventLogger != nil {
+		if t.EventLogger != nil && !t.isShutdownCancellation(closeErr) {
 			t.EventLogger.TCPError(addr, reqAddr, closeErr)
 		}
 	}()
+
 	rc, err := t.HyClient.TCP(reqAddr)
 	if err != nil {
 		closeErr = err
@@ -147,10 +173,11 @@ func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.Packe
 	}
 	var closeErr error
 	defer func() {
-		if t.EventLogger != nil {
+		if t.EventLogger != nil && !t.isShutdownCancellation(closeErr) {
 			t.EventLogger.UDPError(addr, closeErr)
 		}
 	}()
+
 	rc, err := t.HyClient.UDP()
 	if err != nil {
 		closeErr = err
