@@ -212,16 +212,16 @@ var _ tun.Handler = (*tunHandler)(nil)
 
 // JudgeFlow lets every flow through to the system stack, which hands TCP and
 // UDP to the methods below and answers ICMP echo requests itself.
-func (t *tunHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+func (t *tunHandler) JudgeFlow(network uint8, source, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
 	return tun.FlowVerdict{Action: tun.ActionAccept}
 }
 
 // NewDNSPacket is only called for flows judged as tun.ActionHijackDNS,
 // which JudgeFlow never returns.
-func (t *tunHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
+func (t *tunHandler) NewDNSPacket(payload []byte, source, destination M.Socksaddr, writer N.PacketWriter) {
 }
 
-func (t *tunHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (t *tunHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	addr := source.String()
 	reqAddr := destination.String()
 	if t.EventLogger != nil {
@@ -262,7 +262,7 @@ func (t *tunHandler) forwardTCP(ctx context.Context, conn net.Conn, reqAddr stri
 	}
 }
 
-func (t *tunHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (t *tunHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	addr := source.String()
 	if t.EventLogger != nil {
 		t.EventLogger.UDPRequest(addr)
