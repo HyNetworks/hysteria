@@ -914,9 +914,18 @@ func runClient(v *viper.Viper) {
 			return clientTCPRedirect(*config.TCPRedirect, c)
 		})
 	}
+	var tunServer *tun.Server
 	if config.TUN != nil {
+		tunServer, err = newTUNServer(*config.TUN, c)
+		if err != nil {
+			_ = c.Close()
+			logger.Fatal("failed to load client config", zap.Error(err))
+		}
+		// The TUN adds routes and rules to the system, remove them on exit
+		defer tunServer.Close()
 		runner.Add("TUN", func() error {
-			return clientTUN(*config.TUN, c)
+			logger.Info("TUN listening", zap.String("interface", config.TUN.Name))
+			return tunServer.Serve()
 		})
 	}
 
@@ -936,7 +945,11 @@ func runClient(v *viper.Viper) {
 		if r.OK {
 			logger.Info(r.Msg)
 		} else {
-			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
+			// Close these here as Fatal will exit the program without running defer
+			if tunServer != nil {
+				_ = tunServer.Close()
+			}
+			_ = c.Close()
 			if r.Err != nil {
 				logger.Fatal(r.Msg, zap.Error(r.Err))
 			} else {
@@ -1149,34 +1162,33 @@ func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
 	return p.ListenAndServe(laddr)
 }
 
-func clientTUN(config tunConfig, c client.Client) error {
+func newTUNServer(config tunConfig, c client.Client) (*tun.Server, error) {
 	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
 	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
-		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
+		return nil, configError{Field: "tun", Err: fmt.Errorf("TUN is not supported on %s", runtime.GOOS)}
 	}
 	if config.Name == "" {
-		return configError{Field: "name", Err: errors.New("name is empty")}
+		return nil, configError{Field: "tun.name", Err: errors.New("name is empty")}
 	}
 	if config.MTU == 0 {
 		config.MTU = 1500
 	}
-	timeout := int64(config.Timeout.Seconds())
-	if timeout == 0 {
-		timeout = 300
+	if config.Timeout <= 0 {
+		config.Timeout = 5 * time.Minute
 	}
 	if config.Address.IPv4 == "" {
 		config.Address.IPv4 = "100.100.100.101/30"
 	}
 	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
 	if err != nil {
-		return configError{Field: "address.ipv4", Err: err}
+		return nil, configError{Field: "tun.address.ipv4", Err: err}
 	}
 	if config.Address.IPv6 == "" {
 		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
 	}
 	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
 	if err != nil {
-		return configError{Field: "address.ipv6", Err: err}
+		return nil, configError{Field: "tun.address.ipv6", Err: err}
 	}
 	server := &tun.Server{
 		HyClient:     c,
@@ -1184,13 +1196,13 @@ func clientTUN(config tunConfig, c client.Client) error {
 		Logger:       logger,
 		IfName:       config.Name,
 		MTU:          config.MTU,
-		Timeout:      timeout,
+		Timeout:      config.Timeout,
 		Inet4Address: []netip.Prefix{prefix4},
 		Inet6Address: []netip.Prefix{prefix6},
 	}
 	if config.Route != nil {
 		server.AutoRoute = true
-		server.StructRoute = config.Route.Strict
+		server.StrictRoute = config.Route.Strict
 
 		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
 			var prefixes []netip.Prefix
@@ -1214,25 +1226,24 @@ func clientTUN(config tunConfig, c client.Client) error {
 			return prefixes, nil
 		}
 
-		server.Inet4RouteAddress, err = parsePrefixes("route.ipv4", config.Route.IPv4)
+		server.Inet4RouteAddress, err = parsePrefixes("tun.route.ipv4", config.Route.IPv4)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet6RouteAddress, err = parsePrefixes("route.ipv6", config.Route.IPv6)
+		server.Inet6RouteAddress, err = parsePrefixes("tun.route.ipv6", config.Route.IPv6)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet4RouteExcludeAddress, err = parsePrefixes("route.ipv4Exclude", config.Route.IPv4Exclude)
+		server.Inet4RouteExcludeAddress, err = parsePrefixes("tun.route.ipv4Exclude", config.Route.IPv4Exclude)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		server.Inet6RouteExcludeAddress, err = parsePrefixes("route.ipv6Exclude", config.Route.IPv6Exclude)
+		server.Inet6RouteExcludeAddress, err = parsePrefixes("tun.route.ipv6Exclude", config.Route.IPv6Exclude)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	logger.Info("TUN listening", zap.String("interface", config.Name))
-	return server.Serve()
+	return server, nil
 }
 
 // parseServerAddrString parses server address string.

@@ -2,21 +2,27 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"slices"
+	"sync"
+	"time"
 
-	tun "github.com/apernet/sing-tun"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
-	"github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/network"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"go.uber.org/zap"
 
 	"github.com/apernet/hysteria/core/v2/client"
 )
 
+// Server captures TCP and UDP traffic from a TUN interface with sing-tun's
+// "system" stack and forwards it through HyClient.
 type Server struct {
 	HyClient    client.Client
 	EventLogger EventLogger
@@ -24,21 +30,29 @@ type Server struct {
 	// for debugging
 	Logger *zap.Logger
 
-	IfName  string
-	MTU     uint32
-	Timeout int64 // in seconds, also applied to TCP in system stack
+	IfName string
+	MTU    uint32
+	// Timeout is the idle timeout of UDP sessions. The system stack also
+	// uses it for its TCP NAT entries. Must be positive.
+	Timeout time.Duration
 
-	// required by system stack
+	// The system stack uses the next address of the first prefix in each
+	// family, so the prefixes must hold at least two addresses.
 	Inet4Address []netip.Prefix
 	Inet6Address []netip.Prefix
 
 	// auto route
 	AutoRoute                bool
-	StructRoute              bool
+	StrictRoute              bool
 	Inet4RouteAddress        []netip.Prefix
 	Inet6RouteAddress        []netip.Prefix
 	Inet4RouteExcludeAddress []netip.Prefix
 	Inet6RouteExcludeAddress []netip.Prefix
+
+	mu      sync.Mutex
+	closed  bool
+	done    chan struct{}
+	closers []io.Closer // closed in reverse order
 }
 
 type EventLogger interface {
@@ -48,52 +62,146 @@ type EventLogger interface {
 	UDPError(addr string, err error)
 }
 
+// Serve sets up the TUN interface (and its routes, if AutoRoute is set),
+// then forwards traffic until Close is called.
 func (s *Server) Serve() error {
-	if !isIPv6Supported() {
-		s.Logger.Warn("tun-pre-check", zap.String("msg", "IPv6 is not supported or enabled on this system, TUN device is created without IPv6 support."))
-		s.Inet6Address = nil
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return net.ErrClosed
 	}
+	s.done = make(chan struct{})
+	if err := s.start(); err != nil {
+		_ = s.closeLocked()
+		s.mu.Unlock()
+		return err
+	}
+	done := s.done
+	s.mu.Unlock()
+	<-done
+	return nil
+}
+
+// Close removes the TUN interface along with the routes and rules it added,
+// and aborts the connections it is forwarding.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	return s.closeLocked()
+}
+
+func (s *Server) closeLocked() error {
+	s.closed = true
+	var errs []error
+	for _, c := range slices.Backward(s.closers) {
+		errs = append(errs, c.Close())
+	}
+	s.closers = nil
+	if s.done != nil {
+		close(s.done)
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Server) start() error {
+	logger := s.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	inet6Address := s.Inet6Address
+	if !isIPv6Supported() {
+		logger.Warn("IPv6 is not supported or enabled on this system, TUN device is created without IPv6 support")
+		inet6Address = nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.closers = append(s.closers, closerFunc(func() error {
+		cancel()
+		return nil
+	}))
+
+	// sing-tun needs the interface monitor on every platform that has a TUN
+	// implementation: it registers the TUN interface with it, and on Android
+	// it re-applies the rules when the default interface changes.
+	interfaceFinder := control.NewDefaultInterfaceFinder()
+	networkMonitor, err := tun.NewNetworkUpdateMonitor(&singLogger{"tun-monitor", logger})
+	if err != nil {
+		return fmt.Errorf("failed to create network monitor: %w", err)
+	}
+	if err := networkMonitor.Start(); err != nil {
+		return fmt.Errorf("failed to start network monitor: %w", err)
+	}
+	s.closers = append(s.closers, networkMonitor)
+	interfaceMonitor, err := tun.NewDefaultInterfaceMonitor(networkMonitor, &singLogger{"tun-monitor", logger}, tun.DefaultInterfaceMonitorOptions{
+		InterfaceFinder: interfaceFinder,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interface monitor: %w", err)
+	}
+	if err := interfaceMonitor.Start(); err != nil {
+		return fmt.Errorf("failed to start interface monitor: %w", err)
+	}
+	s.closers = append(s.closers, interfaceMonitor)
+
 	tunOpts := tun.Options{
-		Name:                     s.IfName,
-		Inet4Address:             s.Inet4Address,
-		Inet6Address:             s.Inet6Address,
-		MTU:                      s.MTU,
-		GSO:                      true,
-		AutoRoute:                s.AutoRoute,
-		StrictRoute:              s.StructRoute,
+		Name:         s.IfName,
+		Inet4Address: s.Inet4Address,
+		Inet6Address: inet6Address,
+		MTU:          s.MTU,
+		GSO:          true,
+		AutoRoute:    s.AutoRoute,
+		// Leave the system DNS configuration alone: the default would point
+		// it to the TUN's own next address, which nothing answers.
+		DNSMode: tun.DNSModeDisabled,
+		// sing-tun owns the rule priorities [9000, 9010] and flushes the
+		// whole range on setup and teardown, so this must never be 0.
+		IPRoute2RuleIndex:        tun.DefaultIPRoute2RuleIndex,
+		StrictRoute:              s.StrictRoute,
 		Inet4RouteAddress:        s.Inet4RouteAddress,
 		Inet6RouteAddress:        s.Inet6RouteAddress,
 		Inet4RouteExcludeAddress: s.Inet4RouteExcludeAddress,
 		Inet6RouteExcludeAddress: s.Inet6RouteExcludeAddress,
-		Logger: &singLogger{
-			tag:       "tun",
-			zapLogger: s.Logger,
-		},
+		InterfaceFinder:          interfaceFinder,
+		InterfaceMonitor:         interfaceMonitor,
+		Logger:                   &singLogger{"tun", logger},
 	}
 	tunIf, err := tun.New(tunOpts)
 	if err != nil {
 		return fmt.Errorf("failed to create tun interface: %w", err)
 	}
-	defer tunIf.Close()
+	s.closers = append(s.closers, tunIf)
 
 	tunStack, err := tun.NewSystem(tun.StackOptions{
-		Context:    context.Background(),
-		Tun:        tunIf,
-		TunOptions: tunOpts,
-		UDPTimeout: s.Timeout,
-		Handler:    &tunHandler{s},
-		Logger: &singLogger{
-			tag:       "tun-stack",
-			zapLogger: s.Logger,
-		},
+		Context:                ctx,
+		Tun:                    tunIf,
+		TunOptions:             tunOpts,
+		UDPTimeout:             s.Timeout,
+		Handler:                &tunHandler{s},
+		Logger:                 &singLogger{"tun-stack", logger},
 		ForwarderBindInterface: true,
-		InterfaceFinder:        &interfaceFinder{},
+		InterfaceFinder:        interfaceFinder,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create tun stack: %w", err)
 	}
-	defer tunStack.Close()
-	return tunStack.(tun.StackRunner).Run()
+	s.closers = append(s.closers, tunStack)
+	// The stack must be listening before the interface comes up.
+	if err := tunStack.Start(); err != nil {
+		return fmt.Errorf("failed to start tun stack: %w", err)
+	}
+	if err := tunIf.Start(); err != nil {
+		return fmt.Errorf("failed to start tun interface: %w", err)
+	}
+	return nil
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error {
+	return f()
 }
 
 type tunHandler struct {
@@ -102,27 +210,40 @@ type tunHandler struct {
 
 var _ tun.Handler = (*tunHandler)(nil)
 
-func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadata.Metadata) error {
-	addr := m.Source.String()
-	reqAddr := m.Destination.String()
+// JudgeFlow lets every flow through to the system stack, which hands TCP and
+// UDP to the methods below and answers ICMP echo requests itself.
+func (t *tunHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	return tun.FlowVerdict{Action: tun.ActionAccept}
+}
+
+// NewDNSPacket is only called for flows judged as tun.ActionHijackDNS,
+// which JudgeFlow never returns.
+func (t *tunHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
+}
+
+func (t *tunHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	addr := source.String()
+	reqAddr := destination.String()
 	if t.EventLogger != nil {
 		t.EventLogger.TCPRequest(addr, reqAddr)
 	}
-	var closeErr error
-	defer func() {
-		if t.EventLogger != nil {
-			t.EventLogger.TCPError(addr, reqAddr, closeErr)
-		}
-	}()
+	err := t.forwardTCP(ctx, conn, reqAddr)
+	if onClose != nil {
+		onClose(err)
+	}
+	if t.EventLogger != nil {
+		t.EventLogger.TCPError(addr, reqAddr, err)
+	}
+}
+
+func (t *tunHandler) forwardTCP(ctx context.Context, conn net.Conn, reqAddr string) error {
+	defer conn.Close()
 	rc, err := t.HyClient.TCP(reqAddr)
 	if err != nil {
-		closeErr = err
-		// the returned err is ignored by caller
-		return nil
+		return err
 	}
 	defer rc.Close()
 
-	// start forwarding
 	copyErrChan := make(chan error, 2)
 	go func() {
 		_, copyErr := io.Copy(rc, conn)
@@ -133,33 +254,36 @@ func (t *tunHandler) NewConnection(ctx context.Context, conn net.Conn, m metadat
 		copyErrChan <- copyErr
 	}()
 	select {
+	case err = <-copyErrChan:
+		return err
 	case <-ctx.Done():
-		closeErr = ctx.Err()
-	case closeErr = <-copyErrChan:
+		// Server closed
+		return nil
 	}
-	return nil
 }
 
-func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.PacketConn, m metadata.Metadata) error {
-	addr := m.Source.String()
+func (t *tunHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	addr := source.String()
 	if t.EventLogger != nil {
 		t.EventLogger.UDPRequest(addr)
 	}
-	var closeErr error
-	defer func() {
-		if t.EventLogger != nil {
-			t.EventLogger.UDPError(addr, closeErr)
-		}
-	}()
+	err := t.forwardUDP(ctx, conn)
+	if onClose != nil {
+		onClose(err)
+	}
+	if t.EventLogger != nil {
+		t.EventLogger.UDPError(addr, err)
+	}
+}
+
+func (t *tunHandler) forwardUDP(ctx context.Context, conn N.PacketConn) error {
+	defer conn.Close()
 	rc, err := t.HyClient.UDP()
 	if err != nil {
-		closeErr = err
-		// the returned err is simply called into NewError again
-		return nil
+		return err
 	}
 	defer rc.Close()
 
-	// start forwarding
 	copyErrChan := make(chan error, 2)
 	// local <- remote
 	go func() {
@@ -169,13 +293,12 @@ func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.Packe
 				copyErrChan <- err
 				return
 			}
-			var fromAddr metadata.Socksaddr
-			if ap, perr := netip.ParseAddrPort(from); perr == nil {
-				fromAddr = metadata.SocksaddrFromNetIP(ap)
-			} else {
-				fromAddr.Fqdn = from
+			fromAddr, err := netip.ParseAddrPort(from)
+			if err != nil {
+				// A packet written to the TUN needs an IP source address.
+				continue
 			}
-			err = conn.WritePacket(buf.As(bs), fromAddr)
+			err = conn.WritePacket(buf.As(bs), M.SocksaddrFromNetIP(fromAddr))
 			if err != nil {
 				copyErrChan <- err
 				return
@@ -189,12 +312,16 @@ func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.Packe
 
 		for {
 			buffer.Reset()
-			addr, err := conn.ReadPacket(buffer)
+			reqAddr, err := conn.ReadPacket(buffer)
 			if err != nil {
+				if errors.Is(err, io.ErrClosedPipe) {
+					// The stack closed the session after Timeout without traffic
+					err = nil
+				}
 				copyErrChan <- err
 				return
 			}
-			err = rc.Send(buffer.Bytes(), addr.String())
+			err = rc.Send(buffer.Bytes(), reqAddr.String())
 			if err != nil {
 				copyErrChan <- err
 				return
@@ -202,33 +329,10 @@ func (t *tunHandler) NewPacketConnection(ctx context.Context, conn network.Packe
 		}
 	}()
 	select {
+	case err = <-copyErrChan:
+		return err
 	case <-ctx.Done():
-		closeErr = ctx.Err()
-	case closeErr = <-copyErrChan:
+		// Server closed
+		return nil
 	}
-	return nil
-}
-
-func (t *tunHandler) NewError(ctx context.Context, err error) {
-	// unused
-}
-
-type interfaceFinder struct{}
-
-var _ control.InterfaceFinder = (*interfaceFinder)(nil)
-
-func (f *interfaceFinder) InterfaceIndexByName(name string) (int, error) {
-	ifce, err := net.InterfaceByName(name)
-	if err != nil {
-		return -1, err
-	}
-	return ifce.Index, nil
-}
-
-func (f *interfaceFinder) InterfaceNameByIndex(index int) (string, error) {
-	ifce, err := net.InterfaceByIndex(index)
-	if err != nil {
-		return "", err
-	}
-	return ifce.Name, nil
 }
