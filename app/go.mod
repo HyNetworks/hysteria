@@ -18,7 +18,7 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/sagernet/sing v0.8.12-0.20260717023913-84ab32b56cb8
-	github.com/sagernet/sing-tun v0.9.6-0.20260924001923-ddaa4ca25e3b
+	github.com/sagernet/sing-tun v0.9.6
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.12.1
