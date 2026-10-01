@@ -66,22 +66,32 @@ func (_c *mockUDPIO_CheckUDP_Call) RunAndReturn(run func(string) error) *mockUDP
 	return _c
 }
 
-// Hook provides a mock function with given fields: data, reqAddr
-func (_m *mockUDPIO) Hook(data []byte, reqAddr *string) error {
-	ret := _m.Called(data, reqAddr)
+// Hook provides a mock function with given fields: packets, reqAddr
+func (_m *mockUDPIO) Hook(packets [][]byte, reqAddr *string) (bool, error) {
+	ret := _m.Called(packets, reqAddr)
 
 	if len(ret) == 0 {
 		panic("no return value specified for Hook")
 	}
 
-	var r0 error
-	if rf, ok := ret.Get(0).(func([]byte, *string) error); ok {
-		r0 = rf(data, reqAddr)
+	var r0 bool
+	var r1 error
+	if rf, ok := ret.Get(0).(func([][]byte, *string) (bool, error)); ok {
+		return rf(packets, reqAddr)
+	}
+	if rf, ok := ret.Get(0).(func([][]byte, *string) bool); ok {
+		r0 = rf(packets, reqAddr)
 	} else {
-		r0 = ret.Error(0)
+		r0 = ret.Get(0).(bool)
 	}
 
-	return r0
+	if rf, ok := ret.Get(1).(func([][]byte, *string) error); ok {
+		r1 = rf(packets, reqAddr)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
 }
 
 // mockUDPIO_Hook_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Hook'
@@ -90,25 +100,25 @@ type mockUDPIO_Hook_Call struct {
 }
 
 // Hook is a helper method to define mock.On call
-//   - data []byte
+//   - packets [][]byte
 //   - reqAddr *string
-func (_e *mockUDPIO_Expecter) Hook(data interface{}, reqAddr interface{}) *mockUDPIO_Hook_Call {
-	return &mockUDPIO_Hook_Call{Call: _e.mock.On("Hook", data, reqAddr)}
+func (_e *mockUDPIO_Expecter) Hook(packets interface{}, reqAddr interface{}) *mockUDPIO_Hook_Call {
+	return &mockUDPIO_Hook_Call{Call: _e.mock.On("Hook", packets, reqAddr)}
 }
 
-func (_c *mockUDPIO_Hook_Call) Run(run func(data []byte, reqAddr *string)) *mockUDPIO_Hook_Call {
+func (_c *mockUDPIO_Hook_Call) Run(run func(packets [][]byte, reqAddr *string)) *mockUDPIO_Hook_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].([]byte), args[1].(*string))
+		run(args[0].([][]byte), args[1].(*string))
 	})
 	return _c
 }
 
-func (_c *mockUDPIO_Hook_Call) Return(_a0 error) *mockUDPIO_Hook_Call {
-	_c.Call.Return(_a0)
+func (_c *mockUDPIO_Hook_Call) Return(_a0 bool, _a1 error) *mockUDPIO_Hook_Call {
+	_c.Call.Return(_a0, _a1)
 	return _c
 }
 
-func (_c *mockUDPIO_Hook_Call) RunAndReturn(run func([]byte, *string) error) *mockUDPIO_Hook_Call {
+func (_c *mockUDPIO_Hook_Call) RunAndReturn(run func([][]byte, *string) (bool, error)) *mockUDPIO_Hook_Call {
 	_c.Call.Return(run)
 	return _c
 }

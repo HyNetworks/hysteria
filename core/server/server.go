@@ -406,11 +406,11 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	return io.Conn.SendDatagram(buf[:msgN])
 }
 
-func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
-		return io.RequestHook.UDP(data, reqAddr)
+		return io.RequestHook.UDP(packets, reqAddr)
 	} else {
-		return nil
+		return true, nil
 	}
 }
 

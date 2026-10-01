@@ -9,16 +9,14 @@ import (
 	"strings"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
-
 	"github.com/apernet/hysteria/core/v2/server"
-	quicInternal "github.com/apernet/hysteria/extras/v2/sniff/internal/quic"
 	"github.com/apernet/hysteria/extras/v2/utils"
 )
 
 const (
-	sniffDefaultTimeout     = 4 * time.Second
-	sniffMaxHTTPHeaderBytes = 256 * 1024
+	sniffDefaultTimeout = 4 * time.Second
+	sniffMaxTCPBytes    = 64 * 1024
+	sniffMaxUDPPackets  = 8
 )
 
 var _ server.RequestHook = (*Sniffer)(nil)
@@ -33,35 +31,6 @@ type Sniffer struct {
 	RewriteDomain bool // Whether to rewrite the address even when it's already a domain
 	TCPPorts      utils.PortUnion
 	UDPPorts      utils.PortUnion
-}
-
-func (h *Sniffer) isDomain(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	return net.ParseIP(host) == nil
-}
-
-func (h *Sniffer) isHTTP(buf []byte) bool {
-	if len(buf) < 3 {
-		return false
-	}
-	// First 3 bytes should be English letters (whatever HTTP method)
-	for _, b := range buf[:3] {
-		if (b < 'A' || b > 'Z') && (b < 'a' || b > 'z') {
-			return false
-		}
-	}
-	return true
-}
-
-func (h *Sniffer) isTLS(buf []byte) bool {
-	if len(buf) < 3 {
-		return false
-	}
-	return buf[0] >= 0x16 && buf[0] <= 0x17 &&
-		buf[1] == 0x03 && buf[2] <= 0x09
 }
 
 func (h *Sniffer) Check(isUDP bool, reqAddr string) bool {
@@ -88,112 +57,108 @@ func (h *Sniffer) Check(isUDP bool, reqAddr string) bool {
 	}
 }
 
+// TCP reads from the stream until it has an HTTP request header or a TLS ClientHello,
+// or can tell it's neither, and returns everything read.
 func (h *Sniffer) TCP(stream server.HyStream, reqAddr *string) ([]byte, error) {
-	var err error
-	if h.Timeout == 0 {
-		err = stream.SetReadDeadline(time.Now().Add(sniffDefaultTimeout))
-	} else {
-		err = stream.SetReadDeadline(time.Now().Add(h.Timeout))
+	timeout := h.Timeout
+	if timeout == 0 {
+		timeout = sniffDefaultTimeout
 	}
-	if err != nil {
+	if err := stream.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, err
 	}
 	// Make sure to reset the deadline after sniffing
 	defer stream.SetReadDeadline(time.Time{})
-	// Read 3 bytes to determine the protocol
-	pre := make([]byte, 3)
-	n, err := io.ReadFull(stream, pre)
-	if err != nil {
-		// Not enough within the timeout, just return what we have
-		return pre[:n], nil
+
+	rec := &recorder{r: io.LimitReader(stream, sniffMaxTCPBytes)}
+	rewrite(reqAddr, sniffStream(bufio.NewReader(rec)))
+	return rec.buf, nil
+}
+
+// UDP looks for a QUIC ClientHello, which can span multiple packets.
+func (h *Sniffer) UDP(packets [][]byte, reqAddr *string) (bool, error) {
+	var c quicCrypto
+	for i, p := range packets {
+		if !c.feed(p) && i == 0 {
+			// Not QUIC
+			return true, nil
+		}
 	}
-	if h.isHTTP(pre) {
-		// HTTP
-		tr := &teeReader{Stream: stream, Pre: pre}
-		req, _ := http.ReadRequest(bufio.NewReader(io.LimitReader(tr, sniffMaxHTTPHeaderBytes)))
-		if req != nil && req.Host != "" {
-			// req.Host can be host:port, in which case we need to extract the host part
-			host, _, err := net.SplitHostPort(req.Host)
-			if err != nil {
-				// No port, just use the whole string
-				host = req.Host
-			}
-			_, port, err := net.SplitHostPort(*reqAddr)
-			if err != nil {
-				return nil, err
-			}
-			*reqAddr = net.JoinHostPort(host, port)
-		}
-		return tr.Buffer(), nil
-	} else if h.isTLS(pre) {
-		// TLS
-		// Need to read 2 more bytes (content length)
-		pre = append(pre, make([]byte, 2)...)
-		n, err = io.ReadFull(stream, pre[3:])
+	hello, more := clientHello(c.stream())
+	if more && len(packets) < sniffMaxUDPPackets {
+		return false, nil
+	}
+	rewrite(reqAddr, serverName(hello))
+	return true, nil
+}
+
+// sniffStream returns the domain in an HTTP request or a TLS ClientHello read from r.
+func sniffStream(r *bufio.Reader) string {
+	b, err := r.Peek(1)
+	switch {
+	case err != nil:
+		return ""
+	case b[0] == 0x16: // TLS handshake record
+		return serverName(readClientHello(r))
+	case isHTTP(r):
+		req, err := http.ReadRequest(r)
 		if err != nil {
-			// Not enough within the timeout, just return what we have
-			return pre[:3+n], nil
+			return ""
 		}
-		contentLength := int(pre[3])<<8 | int(pre[4])
-		pre = append(pre, make([]byte, contentLength)...)
-		n, err = io.ReadFull(stream, pre[5:])
+		return req.Host
+	}
+	return ""
+}
+
+// isHTTP reports whether r starts with an HTTP method, like GET or M-SEARCH, and a space.
+func isHTTP(r *bufio.Reader) bool {
+	for i := 1; ; i++ {
+		b, err := r.Peek(i)
 		if err != nil {
-			// Not enough within the timeout, just return what we have
-			return pre[:5+n], nil
+			return false
 		}
-		clientHello := utls.UnmarshalClientHello(pre[5:])
-		if clientHello != nil && clientHello.ServerName != "" {
-			_, port, err := net.SplitHostPort(*reqAddr)
-			if err != nil {
-				return nil, err
-			}
-			*reqAddr = net.JoinHostPort(clientHello.ServerName, port)
+		switch c := b[i-1]; {
+		case c == ' ':
+			return i > 1
+		case (c < 'A' || c > 'Z') && c != '-' && c != '_':
+			return false
 		}
-		return pre, nil
-	} else {
-		// Unrecognized protocol, just return what we have
-		return pre, nil
 	}
 }
 
-func (h *Sniffer) UDP(data []byte, reqAddr *string) error {
-	pl, err := quicInternal.ReadCryptoPayload(data)
-	if err != nil || len(pl) < 4 || pl[0] != 0x01 {
-		// Unrecognized protocol, incomplete payload or not a client hello
-		return nil
+// rewrite replaces the host of reqAddr with a sniffed domain, keeping the port.
+func rewrite(reqAddr *string, host string) {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		// HTTP Host can have a port
+		host = h
 	}
-	clientHello := utls.UnmarshalClientHello(pl)
-	if clientHello != nil && clientHello.ServerName != "" {
-		_, port, err := net.SplitHostPort(*reqAddr)
-		if err != nil {
-			return err
-		}
-		*reqAddr = net.JoinHostPort(clientHello.ServerName, port)
+	_, port, err := net.SplitHostPort(*reqAddr)
+	if err != nil || !isDomain(host) {
+		return
 	}
-	return nil
+	*reqAddr = net.JoinHostPort(host, port)
 }
 
-type teeReader struct {
-	Stream server.HyStream
-	Pre    []byte
+func isDomain(s string) bool {
+	if s == "" || len(s) > 253 || net.ParseIP(s) != nil {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '.' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 
+// recorder records everything read through it.
+type recorder struct {
+	r   io.Reader
 	buf []byte
 }
 
-func (c *teeReader) Read(b []byte) (n int, err error) {
-	if len(c.Pre) > 0 {
-		n = copy(b, c.Pre)
-		c.Pre = c.Pre[n:]
-		c.buf = append(c.buf, b[:n]...)
-		return n, nil
-	}
-	n, err = c.Stream.Read(b)
-	if n > 0 {
-		c.buf = append(c.buf, b[:n]...)
-	}
+func (r *recorder) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.buf = append(r.buf, p[:n]...)
 	return n, err
-}
-
-func (c *teeReader) Buffer() []byte {
-	return append(c.Pre, c.buf...)
 }

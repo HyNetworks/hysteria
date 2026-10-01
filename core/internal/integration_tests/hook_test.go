@@ -86,14 +86,19 @@ func TestClientServerHookUDP(t *testing.T) {
 	auth := mocks.NewMockAuthenticator(t)
 	auth.EXPECT().Authenticate(mock.Anything, mock.Anything, mock.Anything).Return(true, "nobody")
 	hook := mocks.NewMockRequestHook(t)
-	hook.EXPECT().Check(true, fakeEchoAddr).Return(true).Once()
-	hook.EXPECT().UDP(mock.Anything, mock.Anything).RunAndReturn(func(bytes []byte, s *string) error {
+	hook.EXPECT().Check(true, fakeEchoAddr).Return(true).Twice()
+	hook.EXPECT().UDP(mock.Anything, mock.Anything).RunAndReturn(func(packets [][]byte, s *string) (bool, error) {
 		assert.Equal(t, fakeEchoAddr, *s)
-		assert.Equal(t, []byte("hello world"), bytes)
+		if len(packets) == 1 {
+			// Hold the first packet back
+			assert.Equal(t, [][]byte{[]byte("hello")}, packets)
+			return false, nil
+		}
+		assert.Equal(t, [][]byte{[]byte("hello"), []byte(" world")}, packets)
 		// Change the address
 		*s = realEchoAddr
-		return nil
-	}).Once()
+		return true, nil
+	}).Twice()
 	s, err := server.NewServer(&server.Config{
 		TLSConfig:     serverTLSConfig(),
 		Conn:          udpConn,
@@ -124,22 +129,25 @@ func TestClientServerHookUDP(t *testing.T) {
 	assert.NoError(t, err)
 	defer conn.Close()
 
-	// Send and receive data
-	sData := []byte("hello world")
+	// Send and receive data, both held packets should reach the real echo server
+	for _, sData := range [][]byte{[]byte("hello"), []byte(" world")} {
+		err = conn.Send(sData, fakeEchoAddr)
+		assert.NoError(t, err)
+	}
+	for _, sData := range [][]byte{[]byte("hello"), []byte(" world")} {
+		rData, rAddr, err := conn.Receive()
+		assert.NoError(t, err)
+		assert.Equal(t, sData, rData)
+		// Hook address change is transparent,
+		// the client should still see the fake echo address it sent packets to
+		assert.Equal(t, fakeEchoAddr, rAddr)
+	}
+
+	// Subsequent packets should also be sent to the real echo server
+	sData := []byte("never stop fighting")
 	err = conn.Send(sData, fakeEchoAddr)
 	assert.NoError(t, err)
 	rData, rAddr, err := conn.Receive()
-	assert.NoError(t, err)
-	assert.Equal(t, sData, rData)
-	// Hook address change is transparent,
-	// the client should still see the fake echo address it sent packets to
-	assert.Equal(t, fakeEchoAddr, rAddr)
-
-	// Subsequent packets should also be sent to the real echo server
-	sData = []byte("never stop fighting")
-	err = conn.Send(sData, fakeEchoAddr)
-	assert.NoError(t, err)
-	rData, rAddr, err = conn.Receive()
 	assert.NoError(t, err)
 	assert.Equal(t, sData, rData)
 	assert.Equal(t, fakeEchoAddr, rAddr)

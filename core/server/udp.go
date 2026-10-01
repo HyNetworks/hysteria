@@ -21,7 +21,7 @@ const (
 type udpIO interface {
 	ReceiveMessage() (*protocol.UDPMessage, error)
 	SendMessage([]byte, *protocol.UDPMessage) error
-	Hook(data []byte, reqAddr *string) error
+	Hook(packets [][]byte, reqAddr *string) (bool, error)
 	UDP(reqAddr string) (UDPConn, error)
 	CheckUDP(reqAddr string) error
 }
@@ -39,9 +39,10 @@ type udpSessionEntry struct {
 	Last         *utils.AtomicTime
 	IO           udpIO
 
-	DialFunc func(addr string, firstMsgData []byte) (conn UDPConn, actualAddr string, err error)
+	DialFunc func(addr string) (UDPConn, error)
 	ExitFunc func(err error)
 
+	held     []*protocol.UDPMessage // Messages held back until the hook is done with them
 	conn     UDPConn
 	connLock sync.Mutex
 	closed   bool
@@ -51,7 +52,7 @@ type udpSessionEntry struct {
 
 func newUDPSessionEntry(
 	id uint32, io udpIO,
-	dialFunc func(string, []byte) (UDPConn, string, error),
+	dialFunc func(string) (UDPConn, error),
 	exitFunc func(error),
 ) (e *udpSessionEntry) {
 	e = &udpSessionEntry{
@@ -91,25 +92,55 @@ func (e *udpSessionEntry) CloseWithErr(err error) {
 // Feed feeds a UDP message to the session.
 // If the message itself is a complete message, or it completes a fragmented message,
 // the message is written to the session's UDP connection, and the number of bytes
-// written is returned.
-// Otherwise, 0 and nil are returned.
+// written is returned. Otherwise, 0 and nil are returned.
+// Until the connection is established, messages are held back instead, and are
+// written together once the hook is done with them.
 func (e *udpSessionEntry) Feed(msg *protocol.UDPMessage) (int, error) {
 	e.Last.Set(time.Now())
 	dfMsg := e.D.Feed(msg)
 	if dfMsg == nil {
 		return 0, nil
 	}
-
-	if e.conn == nil {
-		err := e.initConn(dfMsg)
-		if err != nil {
-			return 0, err
-		}
-		if e.OverrideAddr == "" {
-			e.aclCache = map[string]error{dfMsg.Addr: nil}
-		}
+	if e.conn != nil {
+		return e.write(dfMsg)
 	}
 
+	e.held = append(e.held, dfMsg)
+	packets := make([][]byte, len(e.held))
+	for i, m := range e.held {
+		packets[i] = m.Data
+	}
+	firstAddr := e.held[0].Addr
+	addr := firstAddr
+	done, err := e.IO.Hook(packets, &addr)
+	if err != nil {
+		e.CloseWithErr(err)
+		return 0, err
+	}
+	if !done {
+		return 0, nil
+	}
+	if err := e.initConn(firstAddr, addr); err != nil {
+		return 0, err
+	}
+	if e.OverrideAddr == "" {
+		e.aclCache = map[string]error{firstAddr: nil}
+	}
+	held := e.held
+	e.held = nil
+	total := 0
+	for _, m := range held {
+		n, err := e.write(m)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// write writes a message to the session's UDP connection.
+func (e *udpSessionEntry) write(dfMsg *protocol.UDPMessage) (int, error) {
 	addr := dfMsg.Addr
 	if e.OverrideAddr != "" {
 		addr = e.OverrideAddr
@@ -140,9 +171,10 @@ func (e *udpSessionEntry) checkAddr(addr string) error {
 	return decision
 }
 
-// initConn initializes the UDP connection of the session.
+// initConn initializes the UDP connection of the session to addr,
+// which is what the hook turned the address of the first message into.
 // If no error is returned, the e.conn is set to the new connection.
-func (e *udpSessionEntry) initConn(firstMsg *protocol.UDPMessage) error {
+func (e *udpSessionEntry) initConn(firstAddr, addr string) error {
 	// We need this lock to ensure not to create conn after session exit
 	e.connLock.Lock()
 
@@ -151,7 +183,7 @@ func (e *udpSessionEntry) initConn(firstMsg *protocol.UDPMessage) error {
 		return errors.New("session is closed")
 	}
 
-	conn, actualAddr, err := e.DialFunc(firstMsg.Addr, firstMsg.Data)
+	conn, err := e.DialFunc(addr)
 	if err != nil {
 		// Fail fast if DialFunc failed
 		// (usually indicates the connection has been rejected by the ACL)
@@ -163,10 +195,10 @@ func (e *udpSessionEntry) initConn(firstMsg *protocol.UDPMessage) error {
 
 	e.conn = conn
 
-	if firstMsg.Addr != actualAddr {
+	if firstAddr != addr {
 		// Hook changed the address, enable address override
-		e.OverrideAddr = actualAddr
-		e.OriginalAddr = firstMsg.Addr
+		e.OverrideAddr = addr
+		e.OriginalAddr = firstAddr
 	}
 	go e.receiveLoop()
 
@@ -313,18 +345,11 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 
 	// Create a new session if not exists
 	if entry == nil {
-		dialFunc := func(addr string, firstMsgData []byte) (conn UDPConn, actualAddr string, err error) {
-			// Call the hook
-			err = m.io.Hook(firstMsgData, &addr)
-			if err != nil {
-				return conn, actualAddr, err
-			}
-			actualAddr = addr
+		dialFunc := func(addr string) (UDPConn, error) {
 			// Log the event
 			m.eventLogger.New(msg.SessionID, addr)
 			// Dial target
-			conn, err = m.io.UDP(addr)
-			return conn, actualAddr, err
+			return m.io.UDP(addr)
 		}
 		exitFunc := func(err error) {
 			// Log the event

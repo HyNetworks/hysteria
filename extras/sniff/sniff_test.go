@@ -1,15 +1,21 @@
 package sniff
 
 import (
-	"encoding/base64"
+	"context"
+	"crypto/tls"
 	"io"
+	"net"
+	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/apernet/hysteria/extras/v2/utils"
-
+	"github.com/apernet/quic-go"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"github.com/apernet/hysteria/extras/v2/utils"
 )
 
 func TestSnifferCheck(t *testing.T) {
@@ -36,112 +42,361 @@ func TestSnifferCheck(t *testing.T) {
 }
 
 func TestSnifferTCP(t *testing.T) {
-	sniffer := &Sniffer{
-		Timeout:       1 * time.Second,
-		RewriteDomain: false,
+	goHello := goTLSClientHello(t, "go.sniff.test")
+	chromeHello := readTestdata(t, "tls-chrome153.bin")
+
+	tests := []struct {
+		name     string
+		data     []byte
+		chunk    int // Write the data in chunks of this size, 0 = all at once
+		reqAddr  string
+		wantAddr string
+	}{
+		{
+			name:     "HTTP",
+			data:     []byte("POST /hello HTTP/1.1\r\nHost: example.com\r\nContent-Length: 27\r\n\r\nparam1=value1&param2=value2"),
+			reqAddr:  "111.111.111.111:80",
+			wantAddr: "example.com:80",
+		},
+		{
+			name:     "HTTP host with port",
+			data:     []byte("GET / HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\n\r\n"),
+			reqAddr:  "222.222.222.222:10086",
+			wantAddr: "example.com:10086",
+		},
+		{
+			name:     "HTTP absolute URI",
+			data:     []byte("GET http://absolute.example.com/x HTTP/1.1\r\n\r\n"),
+			reqAddr:  "1.2.3.4:80",
+			wantAddr: "absolute.example.com:80",
+		},
+		{
+			name:     "HTTP byte by byte",
+			data:     []byte("GET / HTTP/1.1\r\nHost: slow.example.com\r\n\r\n"),
+			chunk:    1,
+			reqAddr:  "1.2.3.4:80",
+			wantAddr: "slow.example.com:80",
+		},
+		{
+			name:     "HTTP Chrome 153",
+			data:     readTestdata(t, "http-chrome153.txt"),
+			reqAddr:  "1.2.3.4:80",
+			wantAddr: "chrome.sniff.test:80",
+		},
+		{
+			name:     "HTTP IPv6 host",
+			data:     []byte("GET / HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n\r\n"),
+			reqAddr:  "1.2.3.4:80",
+			wantAddr: "1.2.3.4:80",
+		},
+		{
+			name:     "TLS Go",
+			data:     goHello,
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "go.sniff.test:443",
+		},
+		{
+			name:     "TLS Chrome 153",
+			data:     chromeHello,
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "chrome.sniff.test:443",
+		},
+		{
+			name:     "TLS Firefox 153 ESR",
+			data:     readTestdata(t, "tls-firefox153esr.bin"),
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "firefox.sniff.test:443",
+		},
+		{
+			name:     "TLS curl 8.18 (OpenSSL 3.5)",
+			data:     readTestdata(t, "tls-curl8.18-openssl3.5.bin"),
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "curl.sniff.test:443",
+		},
+		{
+			name:     "TLS byte by byte",
+			data:     chromeHello,
+			chunk:    1,
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "chrome.sniff.test:443",
+		},
+		{
+			name:     "TLS ClientHello fragmented across records",
+			data:     fragmentTLSRecords(chromeHello, 100),
+			chunk:    333,
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "chrome.sniff.test:443",
+		},
+		{
+			name:     "TLS ClientHello followed by other records",
+			data:     append(slices.Clone(goHello), 0x14, 0x03, 0x03, 0x00, 0x01, 0x01),
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "go.sniff.test:443",
+		},
+		{
+			name:     "TLS ClientHello interrupted by another record",
+			data:     append(fragmentTLSRecords(goHello, 100)[:105], 0x14, 0x03, 0x03, 0x00, 0x01, 0x01),
+			reqAddr:  "1.2.3.4:443",
+			wantAddr: "1.2.3.4:443",
+		},
+		{
+			name:     "Unrecognized text",
+			data:     []byte("Wait It's All Ohio? Always Has Been."),
+			reqAddr:  "123.123.123.123:123",
+			wantAddr: "123.123.123.123:123",
+		},
+		{
+			name:     "Unrecognized SSH",
+			data:     []byte("SSH-2.0-OpenSSH_9.6\r\n"),
+			reqAddr:  "123.123.123.123:22",
+			wantAddr: "123.123.123.123:22",
+		},
+		{
+			name:     "Unrecognized binary",
+			data:     []byte("\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a"),
+			reqAddr:  "45.45.45.45:45",
+			wantAddr: "45.45.45.45:45",
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The stream stays open, so the sniffer must stop as soon as it has seen enough,
+			// or it times out and doesn't rewrite anything.
+			stream, client := newPipeStream()
+			defer client.Close()
+			go writeChunks(client, tt.data, tt.chunk)
 
-	buf := &[]byte{}
+			reqAddr := tt.reqAddr
+			putback, err := (&Sniffer{Timeout: 3 * time.Second}).TCP(stream, &reqAddr)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantAddr, reqAddr)
 
-	// Test HTTP
-	*buf = []byte("POST /hello HTTP/1.1\r\n" +
-		"Host: example.com\r\n" +
-		"User-Agent: mamamiya\r\n" +
-		"Content-Length: 27\r\n" +
-		"Connection: keep-alive\r\n\r\n" +
-		"param1=value1&param2=value2")
-	index := 0
-	stream := &mockStream{}
-	stream.EXPECT().SetReadDeadline(mock.Anything).Return(nil)
-	stream.EXPECT().Read(mock.Anything).RunAndReturn(func(bs []byte) (int, error) {
-		if index < len(*buf) {
-			n := copy(bs, (*buf)[index:])
-			index += n
-			return n, nil
-		} else {
-			return 0, io.EOF
-		}
-	})
+			// Nothing is lost: what's put back and what's left make up the whole data
+			rest := make([]byte, len(tt.data)-len(putback))
+			_, err = io.ReadFull(stream, rest)
+			require.NoError(t, err)
+			assert.Equal(t, tt.data, append(putback, rest...))
+		})
+	}
+}
 
-	// Rewrite IP to domain
-	reqAddr := "111.111.111.111:80"
-	putback, err := sniffer.TCP(stream, &reqAddr)
+func TestSnifferTCPTimeout(t *testing.T) {
+	stream, client := newPipeStream()
+	defer client.Close()
+	go client.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n"))
+
+	reqAddr := "66.66.66.66:80"
+	start := time.Now()
+	putback, err := (&Sniffer{Timeout: 500 * time.Millisecond}).TCP(stream, &reqAddr)
 	assert.NoError(t, err)
-	assert.Equal(t, *buf, putback)
-	assert.Equal(t, "example.com:80", reqAddr)
+	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.Equal(t, []byte("GET / HTTP/1.1\r\nHost: example.com\r\n"), putback)
+	assert.Equal(t, "66.66.66.66:80", reqAddr)
+}
 
-	// Test HTTP with Host as host:port
-	*buf = []byte("GET / HTTP/1.1\r\n" +
-		"Host: example.com:8080\r\n" +
-		"User-Agent: test-agent\r\n" +
-		"Accept: */*\r\n\r\n")
-	index = 0
-	reqAddr = "222.222.222.222:10086"
-	putback, err = sniffer.TCP(stream, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, *buf, putback)
-	assert.Equal(t, "example.com:10086", reqAddr)
+func TestSnifferTCPMaxBytes(t *testing.T) {
+	stream, client := newPipeStream()
+	defer client.Close()
+	data := []byte("GET / HTTP/1.1\r\nX-Big: " + strings.Repeat("a", 2*sniffMaxTCPBytes) + "\r\nHost: example.com\r\n\r\n")
+	go client.Write(data)
 
-	// Test TLS
-	*buf, err = base64.StdEncoding.DecodeString("FgMBARcBAAETAwPJL2jlt1OAo+Rslkjv/aqKiTthKMaCKg2Gvd+uALDbDCDdY+UIk8ouadEB9fC3j52Y1i7SJZqGIgBRIS6kKieYrAAoEwITAcAswCvAMMAvwCTAI8AowCfACsAJwBTAEwCdAJwAPQA8ADUALwEAAKIAAAAOAAwAAAlpcGluZm8uaW8ABQAFAQAAAAAAKwAJCAMEAwMDAgMBAA0AGgAYCAQIBQgGBAEFAQIBBAMFAwIDAgIGAQYDACMAAAAKAAgABgAdABcAGAAQAAsACQhodHRwLzEuMQAzACYAJAAdACBguQbqNJNyamYxYcrBFpBP7pWv5TgZsP9gwGtMYNKVBQAxAAAAFwAA/wEAAQAALQACAQE=")
+	reqAddr := "66.66.66.66:80"
+	putback, err := (&Sniffer{Timeout: 3 * time.Second}).TCP(stream, &reqAddr)
 	assert.NoError(t, err)
-	index = 0
-	reqAddr = "222.222.222.222:443"
-	putback, err = sniffer.TCP(stream, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, *buf, putback)
-	assert.Equal(t, "ipinfo.io:443", reqAddr)
-
-	// Test unrecognized 1
-	*buf = []byte("Wait It's All Ohio? Always Has Been.")
-	index = 0
-	reqAddr = "123.123.123.123:123"
-	putback, err = sniffer.TCP(stream, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, *buf, putback)
-	assert.Equal(t, "123.123.123.123:123", reqAddr)
-
-	// Test unrecognized 2
-	*buf = []byte("\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a")
-	index = 0
-	reqAddr = "45.45.45.45:45"
-	putback, err = sniffer.TCP(stream, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, []byte("\x01\x02\x03"), putback)
-	assert.Equal(t, "45.45.45.45:45", reqAddr)
-
-	// Test timeout
-	blockStream := &mockStream{}
-	blockStream.EXPECT().SetReadDeadline(mock.Anything).Return(nil)
-	blockStream.EXPECT().Read(mock.Anything).RunAndReturn(func(bs []byte) (int, error) {
-		time.Sleep(2 * time.Second)
-		return 0, io.EOF
-	})
-	reqAddr = "66.66.66.66:66"
-	putback, err = sniffer.TCP(blockStream, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, []byte{}, putback)
-	assert.Equal(t, "66.66.66.66:66", reqAddr)
+	assert.Equal(t, data[:sniffMaxTCPBytes], putback)
+	assert.Equal(t, "66.66.66.66:80", reqAddr)
 }
 
 func TestSnifferUDP(t *testing.T) {
-	sniffer := &Sniffer{
-		Timeout:       1 * time.Second,
-		RewriteDomain: false,
+	chrome := readTestdataPackets(t, "quic-chrome153", 3)
+	firefox := readTestdataPackets(t, "quic-firefox153esr", 2)
+	curl := readTestdataPackets(t, "quic-curl8.14-openssl3.5", 2)
+
+	tests := []struct {
+		name     string
+		packets  [][]byte
+		wantAddr string
+		wantN    int // Packets needed before the sniffer is done
+	}{
+		// Chrome shuffles the ClientHello fragments across two packets, and retransmits them split differently
+		{"Chrome 153", chrome, "chrome.sniff.test:443", 2},
+		{"Chrome 153 reordered", [][]byte{chrome[1], chrome[0]}, "chrome.sniff.test:443", 2},
+		{"Chrome 153 retransmitted", [][]byte{chrome[1], chrome[2]}, "chrome.sniff.test:443", 2},
+		{"Firefox 153 ESR", firefox, "firefox.sniff.test:443", 2},
+		{"Firefox 153 ESR reordered", [][]byte{firefox[1], firefox[0]}, "firefox.sniff.test:443", 2},
+		{"curl 8.14 (OpenSSL 3.5)", curl, "curl.sniff.test:443", 2},
+		// quiche retransmits the first packet before sending the second
+		{"quiche", readTestdataPackets(t, "quic-quiche", 3), "quiche.sniff.test:443", 3},
+		{"ngtcp2 1.11", readTestdataPackets(t, "quic-ngtcp2-1.11", 1), "ngtcp2.sniff.test:443", 1},
+		{"aioquic 1.2", readTestdataPackets(t, "quic-aioquic1.2", 1), "aioquic.sniff.test:443", 1},
+		{"Not QUIC", [][]byte{[]byte("oh my sweet summer child")}, "1.2.3.4:443", 1},
+		{"Unsupported version", [][]byte{append([]byte{0xc0, 0xff, 0x00, 0x00, 0x1d}, chrome[0][5:]...)}, "1.2.3.4:443", 1},
+		{"Other connections ignored", [][]byte{chrome[0], firefox[1], curl[1], chrome[1]}, "chrome.sniff.test:443", 4},
+		{"Gives up", slices.Repeat([][]byte{chrome[0]}, sniffMaxUDPPackets), "1.2.3.4:443", sniffMaxUDPPackets},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertSniffUDP(t, tt.packets, tt.wantAddr, tt.wantN)
+		})
+	}
+}
 
-	// Test QUIC
-	reqAddr := "2.3.4.5:443"
-	pkt, err := base64.StdEncoding.DecodeString("ygAAAAEIwugWgPS7ulYAAES8hY891uwgGE9GG4CPOLd+nsDe28raso24lCSFmlFwYQG1uF39ikbL13/R9ZTghYmTl+jEbr6F9TxxRiOgpTmKRmh6aKZiIiVfy5pVRckovaI8lq0WRoW9xoFNTyYtQP8TVJ3bLCK+zUqpquEQSyWf7CE43ywayyMpE9UlIoPXFWCoopXLM1SvzdQ+17P51N9KR7m4emti4DWWTBLMQOvrwd2HEEkbiZdRO1wf6ZXJlIat5dN0R/6uod60OFPO+u+awvq67MoMReC7+5I/xWI+xx6o4JpnZNn6YPG8Gqi8hS6doNcAAdtD8h5eMLuHCCgkpX3QVjjfWtcOhtw9xKjU43HhUPwzUTv+JDLgwuTQCTmlfYlb3B+pk4b2I9si0tJ0SBuYaZ2VQPtZbj2hpGXw3gn11pbN8xsbKkQL50+Scd4dGJxWQlGaJHeaU5WOCkxLXc635z8m5XO/CBHVYPGp4pfwfwNUgbe5WF+3MaUIlDB8dMfsnrO0BmZPo379jVx0SFLTAiS8wAdHib1WNEY8qKYnTWuiyxYg1GZEhJt0nXmI+8f0eJq42DgHBWC+Rf5rRBr/Sf25o3mFAmTUaul0Woo9/CIrpT73B63N91xd9A77i4ru995YG8l9Hen+eLtpDU9Q9376nwMDYBzeYG9U/Rn0Urbm6q4hmAgV/xlNJ2rAyDS+yLnwqD6I0PRy8bZJEttcidb/SkOyrpgMiAzWeT+SO+c/k+Y8H0UTRa05faZUrhuUaym9wAcaIVRA6nFI+fejfjVp+7afFv+kWn3vCqQEij+CRHuxkltrixZMD2rfYj6NUW7TTYBtPRtuV/V0ZIDjRR26vr4K+0D84+l3c0mA/l6nmpP5kkco3nmpdjtQN6sGXL7+5o0nnsftX5d6/n5mLyEpP+AEDl1zk3iqkS62RsITwql6DMMoGbSDdUpMclCIeM0vlo3CkxGMO7QA9ruVeNddkL3EWMivl+uxO43sXEEqYQHVl4N75y63t05GOf7/gm9Kb/BJ8MpG9ViEkVYaskQCzi3D8bVpzo8FfTj8te8B6c3ikc/cm7r8k0ZcZpr+YiLGDYq+0ilHxpqJfmq8dPkSvxdzLcUSvy7+LMQ/TTobRSF7L4JhtDKck0+00vl9H35Tkh9N+MsVtpKdWyoqZ4XaK2Nx1M6AieczXpdFc0y7lYPoUfF4IeW8WzeVUclol5ElYjkyFz/lDOGAe1bF2g5AYaGWCPiGleVZknNdD5ihB8W8Mfkt1pEwq2S97AHrppqkf/VoIfZzeqH8wUFw8fDDrZIpnoa0rW7HfwIQaqJhPCyB9Z6TVbV4x9UWmaHfVAcinCK/7o10dtaj3rvEqcUC/iPceGq3Tqv/p9GGNJ+Ci2JBjXqNxYr893Llk75VdPD9pM6y1SM0P80oXNy32VMtafkFFST8GpvvqWcxUJ93kzaY8RmU1g3XFOImSU2utU6+FUQ2Pn5uLwcfT2cTYfTpPGh+WXjSbZ6trqdEMEsLHybuPo2UN4WpVLXVQma3kSaHQggcLlEip8GhEUAy/xCb2eKqhI4HkDpDjwDnDVKufWlnRaOHf58cc8Woi+WT8JTOkHC+nBEG6fKRPHDG08U5yayIQIjI")
-	assert.NoError(t, err)
-	err = sniffer.UDP(pkt, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, "www.notion.so:443", reqAddr)
+// TestSnifferUDPQUICGo sniffs the first flight of live quic-go clients.
+func TestSnifferUDPQUICGo(t *testing.T) {
+	tests := []struct {
+		name string
+		conf *quic.Config
+	}{
+		{"v1", &quic.Config{}},
+		{"v2", &quic.Config{Versions: []quic.Version{quic.Version2}}},
+		{"Chrome parrot", &quic.Config{ChromeParrot: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packets := quicGoFirstFlight(t, tt.conf, "quic-go.sniff.test", 3)
+			assertSniffUDP(t, packets, "quic-go.sniff.test:443", 2)
+		})
+	}
+}
 
-	// Test unrecognized
-	pkt = []byte("oh my sweet summer child")
-	reqAddr = "90.90.90.90:90"
-	err = sniffer.UDP(pkt, &reqAddr)
-	assert.NoError(t, err)
-	assert.Equal(t, "90.90.90.90:90", reqAddr)
+func TestRewrite(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{"example.com", "example.com:443"},
+		{"example.com:8443", "example.com:443"},
+		{"under_score.example.com.", "under_score.example.com.:443"},
+		{"", "1.2.3.4:443"},
+		{"5.6.7.8", "1.2.3.4:443"},
+		{"[2001:db8::1]:80", "1.2.3.4:443"},
+		{"evil.com/path", "1.2.3.4:443"},
+		{"evil.com\x00", "1.2.3.4:443"},
+		{strings.Repeat("a", 254), "1.2.3.4:443"},
+	}
+	for _, tt := range tests {
+		reqAddr := "1.2.3.4:443"
+		rewrite(&reqAddr, tt.host)
+		assert.Equal(t, tt.want, reqAddr, "host %q", tt.host)
+	}
+}
+
+// assertSniffUDP feeds packets to the sniffer one by one, and checks that it's done
+// after exactly n packets, with the address rewritten to want.
+func assertSniffUDP(t *testing.T, packets [][]byte, want string, n int) {
+	t.Helper()
+	sniffer := &Sniffer{}
+	for i := 1; i <= n; i++ {
+		held := make([][]byte, i)
+		for j := range held {
+			held[j] = slices.Clone(packets[j])
+		}
+		reqAddr := "1.2.3.4:443"
+		done, err := sniffer.UDP(held, &reqAddr)
+		require.NoError(t, err)
+		if i < n {
+			require.False(t, done, "done after %d packets", i)
+			require.Equal(t, "1.2.3.4:443", reqAddr)
+			continue
+		}
+		require.True(t, done, "not done after %d packets", i)
+		require.Equal(t, want, reqAddr)
+		for j := range held {
+			require.Equal(t, packets[j], held[j], "packet %d was modified", j)
+		}
+	}
+}
+
+// quicGoFirstFlight returns the first n datagrams a quic-go client sends.
+func quicGoFirstFlight(t *testing.T, conf *quic.Config, serverName string, n int) [][]byte {
+	t.Helper()
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dialDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-dialDone
+	}()
+	go func() {
+		defer close(dialDone)
+		tlsConf := &tls.Config{ServerName: serverName, NextProtos: []string{"h3"}}
+		_, _ = quic.DialAddr(ctx, ln.LocalAddr().String(), tlsConf, conf)
+	}()
+
+	var packets [][]byte
+	buf := make([]byte, 2048)
+	for len(packets) < n {
+		require.NoError(t, ln.SetReadDeadline(time.Now().Add(5*time.Second)))
+		l, _, err := ln.ReadFrom(buf)
+		require.NoError(t, err)
+		packets = append(packets, slices.Clone(buf[:l]))
+	}
+	return packets
+}
+
+// goTLSClientHello returns the TLS records carrying a crypto/tls ClientHello.
+func goTLSClientHello(t *testing.T, serverName string) []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	defer server.Close()
+	go func() {
+		_ = tls.Client(client, &tls.Config{ServerName: serverName}).Handshake()
+		client.Close()
+	}()
+	buf := make([]byte, 16384)
+	n, err := server.Read(buf)
+	require.NoError(t, err)
+	return buf[:n]
+}
+
+// fragmentTLSRecords splits the handshake messages in a TLS record into records of size n.
+func fragmentTLSRecords(record []byte, n int) []byte {
+	var out []byte
+	for p := range slices.Chunk(record[5:], n) {
+		out = append(out, 0x16, 0x03, 0x01, byte(len(p)>>8), byte(len(p)))
+		out = append(out, p...)
+	}
+	return out
+}
+
+func readTestdata(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile("testdata/" + name)
+	require.NoError(t, err)
+	return b
+}
+
+func readTestdataPackets(t *testing.T, prefix string, n int) [][]byte {
+	t.Helper()
+	packets := make([][]byte, n)
+	for i := range packets {
+		packets[i] = readTestdata(t, prefix+"-"+string(rune('0'+i))+".bin")
+	}
+	return packets
+}
+
+// pipeStream is a server.HyStream backed by a net.Pipe.
+type pipeStream struct {
+	net.Conn
+}
+
+func (pipeStream) StreamID() quic.StreamID { return 0 }
+
+func newPipeStream() (pipeStream, net.Conn) {
+	s, c := net.Pipe()
+	return pipeStream{s}, c
+}
+
+func writeChunks(w io.Writer, data []byte, chunk int) {
+	if chunk == 0 {
+		chunk = len(data)
+	}
+	for p := range slices.Chunk(data, chunk) {
+		if _, err := w.Write(p); err != nil {
+			return
+		}
+	}
 }

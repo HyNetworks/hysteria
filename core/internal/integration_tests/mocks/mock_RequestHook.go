@@ -126,22 +126,32 @@ func (_c *MockRequestHook_TCP_Call) RunAndReturn(run func(server.HyStream, *stri
 	return _c
 }
 
-// UDP provides a mock function with given fields: data, reqAddr
-func (_m *MockRequestHook) UDP(data []byte, reqAddr *string) error {
-	ret := _m.Called(data, reqAddr)
+// UDP provides a mock function with given fields: packets, reqAddr
+func (_m *MockRequestHook) UDP(packets [][]byte, reqAddr *string) (bool, error) {
+	ret := _m.Called(packets, reqAddr)
 
 	if len(ret) == 0 {
 		panic("no return value specified for UDP")
 	}
 
-	var r0 error
-	if rf, ok := ret.Get(0).(func([]byte, *string) error); ok {
-		r0 = rf(data, reqAddr)
+	var r0 bool
+	var r1 error
+	if rf, ok := ret.Get(0).(func([][]byte, *string) (bool, error)); ok {
+		return rf(packets, reqAddr)
+	}
+	if rf, ok := ret.Get(0).(func([][]byte, *string) bool); ok {
+		r0 = rf(packets, reqAddr)
 	} else {
-		r0 = ret.Error(0)
+		r0 = ret.Get(0).(bool)
 	}
 
-	return r0
+	if rf, ok := ret.Get(1).(func([][]byte, *string) error); ok {
+		r1 = rf(packets, reqAddr)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
 }
 
 // MockRequestHook_UDP_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'UDP'
@@ -150,25 +160,25 @@ type MockRequestHook_UDP_Call struct {
 }
 
 // UDP is a helper method to define mock.On call
-//   - data []byte
+//   - packets [][]byte
 //   - reqAddr *string
-func (_e *MockRequestHook_Expecter) UDP(data interface{}, reqAddr interface{}) *MockRequestHook_UDP_Call {
-	return &MockRequestHook_UDP_Call{Call: _e.mock.On("UDP", data, reqAddr)}
+func (_e *MockRequestHook_Expecter) UDP(packets interface{}, reqAddr interface{}) *MockRequestHook_UDP_Call {
+	return &MockRequestHook_UDP_Call{Call: _e.mock.On("UDP", packets, reqAddr)}
 }
 
-func (_c *MockRequestHook_UDP_Call) Run(run func(data []byte, reqAddr *string)) *MockRequestHook_UDP_Call {
+func (_c *MockRequestHook_UDP_Call) Run(run func(packets [][]byte, reqAddr *string)) *MockRequestHook_UDP_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].([]byte), args[1].(*string))
+		run(args[0].([][]byte), args[1].(*string))
 	})
 	return _c
 }
 
-func (_c *MockRequestHook_UDP_Call) Return(_a0 error) *MockRequestHook_UDP_Call {
-	_c.Call.Return(_a0)
+func (_c *MockRequestHook_UDP_Call) Return(done bool, err error) *MockRequestHook_UDP_Call {
+	_c.Call.Return(done, err)
 	return _c
 }
 
-func (_c *MockRequestHook_UDP_Call) RunAndReturn(run func([]byte, *string) error) *MockRequestHook_UDP_Call {
+func (_c *MockRequestHook_UDP_Call) RunAndReturn(run func([][]byte, *string) (bool, error)) *MockRequestHook_UDP_Call {
 	_c.Call.Return(run)
 	return _c
 }

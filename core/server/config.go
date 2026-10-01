@@ -146,12 +146,14 @@ type CongestionConfig struct {
 // The returned byte slice, if not empty, will be sent to the remote before proxying - this is
 // mainly for "putting back" the content read from the client for sniffing, etc.
 // Return a non-nil error to abort the connection.
-// Note that due to the current architectural limitations, it can only inspect the first packet
-// of a UDP connection. It also cannot put back any data as the first packet is always sent as-is.
+// For UDP, the first packets of a session are held back until the hook is done with them:
+// UDP is called with all the packets held so far each time a new one arrives, and returns
+// false to wait for the next one. The hook must give up eventually, as held packets are only
+// sent (as-is, to the possibly modified reqAddr) once it returns true.
 type RequestHook interface {
 	Check(isUDP bool, reqAddr string) bool
 	TCP(stream HyStream, reqAddr *string) ([]byte, error)
-	UDP(data []byte, reqAddr *string) error
+	UDP(packets [][]byte, reqAddr *string) (done bool, err error)
 }
 
 // Outbound provides the implementation of how the server should connect to remote servers.
