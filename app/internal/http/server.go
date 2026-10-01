@@ -283,7 +283,12 @@ func sendSimpleResponse(conn net.Conn, req *http.Request, statusCode int) error 
 	// Also, prevent the "Connection: close" header.
 	resp.Close = false
 	resp.Uncompressed = true
-	return resp.Write(conn)
+	var buf bytes.Buffer
+	if err := resp.Write(&buf); err != nil {
+		return err
+	}
+	_, err := conn.Write(buf.Bytes())
+	return err
 }
 
 // sendProxyAuthRequired sends a 407 Proxy Authentication Required response.
@@ -297,5 +302,10 @@ func sendProxyAuthRequired(conn net.Conn, req *http.Request, realm string) error
 		Header:     http.Header{},
 	}
 	resp.Header.Set("Proxy-Authenticate", fmt.Sprintf("Basic realm=%q", realm))
-	return resp.Write(conn)
+	var buf bytes.Buffer
+	if err := resp.Write(&buf); err != nil {
+		return err
+	}
+	_, err := conn.Write(buf.Bytes())
+	return err
 }
