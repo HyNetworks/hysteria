@@ -546,7 +546,13 @@ func (c *serverConfig) realmHTTPClient() *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-const realmConnectSTUNCacheTTL = 10 * time.Second
+const (
+	realmConnectSTUNCacheTTL = 10 * time.Second
+	// realmRegisterTimeout bounds one registration HTTP call. It is far below
+	// kernel TCP retransmission limits so a blackholed control connection
+	// fails into the existing re-register backoff.
+	realmRegisterTimeout = 10 * time.Second
+)
 
 type realmServerRuntime struct {
 	cancel      context.CancelFunc
@@ -593,12 +599,18 @@ func (r *realmServerRuntime) registerWithBackoff(ctx context.Context) realmSessi
 	backoff := time.Second
 	for ctx.Err() == nil {
 		if _, _, err := r.refreshAddrs(ctx); err != nil {
+			if ctx.Err() != nil {
+				return realmSession{}
+			}
 			logger.Warn("realm STUN refresh before re-register failed", zap.String("realm", r.realmID), zap.Error(err))
 		}
 		sess, err := r.register(ctx)
 		if err == nil {
 			r.setSession(sess)
 			return sess
+		}
+		if ctx.Err() != nil {
+			return realmSession{}
 		}
 		if isRealmRegisterFatal(err) {
 			logger.Error("realm re-register rejected; giving up", zap.String("realm", r.realmID), zap.Error(err))
@@ -622,7 +634,9 @@ func (r *realmServerRuntime) register(ctx context.Context) (realmSession, error)
 		zap.String("realm", r.realmID),
 		zap.Strings("addresses", addrPortStrings(localAddrs)))
 	start := time.Now()
-	registerResp, err := r.client.Register(ctx, r.realmID, addrPortStrings(localAddrs))
+	regCtx, regCancel := context.WithTimeout(ctx, realmRegisterTimeout)
+	registerResp, err := r.client.Register(regCtx, r.realmID, addrPortStrings(localAddrs))
+	regCancel()
 	if err != nil {
 		return realmSession{}, err
 	}
@@ -646,6 +660,9 @@ func (r *realmServerRuntime) runSession(ctx context.Context, sess realmSession) 
 	go func() { errCh <- r.eventsLoop(sessionCtx, sess) }()
 	err := <-errCh
 	cancel()
+	// Drain the sibling loop so teardown finishes both control operations
+	// before another session can start.
+	<-errCh
 	return err
 }
 
@@ -675,8 +692,17 @@ func (r *realmServerRuntime) heartbeatLoop(ctx context.Context, sess realmSessio
 				lastPublished = current
 				logger.Debug("realm addresses changed", zap.String("realm", r.realmID), zap.Strings("addresses", req.Addresses))
 			}
-			resp, err := r.client.Heartbeat(ctx, r.realmID, sess.id, req)
+			// Bound this attempt by the session TTL, including the zero-TTL
+			// fallback, so a blackholed connection reaches the loss path
+			// below instead of waiting out kernel TCP retransmission.
+			hbCtx, hbCancel := context.WithTimeout(ctx, sessionTTLDuration(sess.ttl))
+			resp, err := r.client.Heartbeat(hbCtx, r.realmID, sess.id, req)
+			hbCancel()
 			if err != nil {
+				if ctx.Err() != nil {
+					logger.Debug("realm heartbeat loop stopped", zap.String("realm", r.realmID))
+					return ctx.Err()
+				}
 				if isRealmSessionInvalid(err) {
 					return errRealmSessionInvalid
 				}
@@ -712,19 +738,34 @@ func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) 
 			return ctx.Err()
 		}
 		logger.Debug("realm events stream connecting", zap.String("realm", r.realmID))
-		stream, err := r.client.Events(ctx, r.realmID, sess.id)
+		// One lifetime covers header acquisition and body reads. Expiry renews
+		// the stream even when heartbeats are still succeeding.
+		bound := sessionTTLDuration(sess.ttl)
+		started := time.Now()
+		streamCtx, streamCancel := context.WithTimeout(ctx, bound)
+		stream, err := r.client.Events(streamCtx, r.realmID, sess.id)
 		if err != nil {
+			timedOut := streamCtx.Err() != nil
+			streamCancel()
+			if ctx.Err() != nil {
+				logger.Debug("realm events loop stopped", zap.String("realm", r.realmID))
+				return ctx.Err()
+			}
 			if isRealmSessionInvalid(err) {
 				return errRealmSessionInvalid
 			}
 			logger.Warn("realm events stream failed", zap.String("realm", r.realmID), zap.Error(err))
-			if time.Since(lastOK) > sessionTTLDuration(sess.ttl) {
+			// A single TTL-bounded open that started inside the loss window
+			// still takes the backoff retry. Lose the session once failures
+			// outlast the TTL.
+			if time.Since(lastOK) > bound && (!timedOut || started.Sub(lastOK) > bound) {
 				return errRealmSessionLost
 			}
 			logger.Debug("realm events stream reconnect scheduled",
 				zap.String("realm", r.realmID),
 				zap.String("backoff", formatLogDuration(backoff)))
 			if !sleepContext(ctx, backoff) {
+				logger.Debug("realm events loop stopped", zap.String("realm", r.realmID))
 				return ctx.Err()
 			}
 			if backoff < 30*time.Second {
@@ -738,10 +779,20 @@ func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) 
 		for {
 			ev, err := stream.Next()
 			if err != nil {
+				timedOut := streamCtx.Err() != nil
+				streamCancel()
 				_ = stream.Close()
-				if ctx.Err() == nil {
-					logger.Warn("realm events stream dropped", zap.String("realm", r.realmID), zap.Error(err))
+				if ctx.Err() != nil {
+					logger.Debug("realm events loop stopped", zap.String("realm", r.realmID))
+					return ctx.Err()
 				}
+				if timedOut {
+					// Planned renewal. Silence on a live session is not session loss.
+					logger.Debug("realm events stream renewing", zap.String("realm", r.realmID))
+					lastOK = time.Now()
+					break
+				}
+				logger.Warn("realm events stream dropped", zap.String("realm", r.realmID), zap.Error(err))
 				break
 			}
 			lastOK = time.Now()
