@@ -2,7 +2,11 @@ package cmd
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"testing"
 	"time"
 
@@ -10,6 +14,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/realm"
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 
 	"github.com/spf13/viper"
 )
@@ -354,4 +359,41 @@ func TestRealmConnectAddrsCacheHit(t *testing.T) {
 	// Mutating the returned slice must not affect the cached one.
 	got[0] = netip.MustParseAddrPort("198.51.100.1:1")
 	assert.Equal(t, want, rt.addrs)
+}
+
+func TestRealmStalledHeartbeatLosesSession(t *testing.T) {
+	previousLogger := logger
+	logger = zap.NewNop()
+	t.Cleanup(func() { logger = previousLogger })
+
+	// Withhold the response so the call can finish only when its context ends.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(ts.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	baseURL, err := url.Parse(ts.URL)
+	assert.NoError(t, err)
+	client, err := realm.NewClient(realm.ClientConfig{BaseURL: baseURL, Token: "token"})
+	assert.NoError(t, err)
+	rt := &realmServerRuntime{
+		client:  client,
+		realmID: "realm",
+		config:  serverConfigRealm{HeartbeatInterval: 50 * time.Millisecond},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.heartbeatLoop(ctx, realmSession{id: "sess", ttl: 1})
+	}()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, errRealmSessionLost)
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled heartbeat did not lose the session")
+	}
 }
