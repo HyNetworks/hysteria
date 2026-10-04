@@ -26,7 +26,7 @@ require (
 	go.uber.org/zap v1.28.0
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
 	golang.org/x/sync v0.22.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
@@ -34,7 +34,7 @@ require (
 	github.com/apernet/quic-go v0.63.1-0.20261004002722-c6dc26bdb68f // indirect
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
-	github.com/database64128/tfo-go/v2 v2.3.3 // indirect
+	github.com/database64128/tfo-go/v2 v2.4.1 // indirect
 	github.com/florianl/go-nfqueue/v2 v2.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
