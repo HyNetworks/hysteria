@@ -54,6 +54,10 @@ func testMockConn(t *testing.T, b []byte) net.Conn {
 		isClosed = true
 		return nil
 	})
+	// dispatch() bounds the protocol sniff with a read deadline and clears it
+	// afterwards. Maybe() because not every caller of this helper reaches
+	// dispatch.
+	mockConn.EXPECT().SetReadDeadline(mock.Anything).Return(nil).Maybe()
 	return mockConn
 }
 

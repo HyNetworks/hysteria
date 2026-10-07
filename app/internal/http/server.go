@@ -36,6 +36,21 @@ type EventLogger interface {
 	HTTPError(addr net.Addr, reqURL string, err error)
 }
 
+const (
+	// handshakeTimeout bounds how long a client may take to send its FIRST
+	// request header. A connection that is opened and then never speaks is not
+	// a client waiting to be served.
+	handshakeTimeout = 10 * time.Second
+
+	// keepAliveIdleTimeout bounds the wait BETWEEN keep-alive requests, where a
+	// silent client is ordinary rather than suspect. Deliberately much longer
+	// than handshakeTimeout: browsers hold idle keep-alive connections for tens
+	// of seconds, and closing them sooner would trade one leak for a lot of
+	// needless reconnects. Matches the 60s already used by the other entry
+	// points.
+	keepAliveIdleTimeout = 60 * time.Second
+)
+
 func (s *Server) Serve(listener net.Listener) error {
 	for {
 		conn, err := listener.Accept()
@@ -48,13 +63,25 @@ func (s *Server) Serve(listener net.Listener) error {
 
 func (s *Server) dispatch(conn net.Conn) {
 	bufReader := bufio.NewReader(conn)
+	first := true
 	for {
+		// Bound the wait for a request header; without it a client that connects
+		// and stays silent pins a goroutine and a descriptor for the lifetime of
+		// the process. Cleared below once the request is in, so it never applies
+		// to the body or to proxied traffic.
+		timeout := keepAliveIdleTimeout
+		if first {
+			timeout = handshakeTimeout
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		req, err := http.ReadRequest(bufReader)
 		if err != nil {
 			// Connection error or invalid request
 			_ = conn.Close()
 			return
 		}
+		_ = conn.SetReadDeadline(time.Time{})
+		first = false
 		if s.AuthFunc != nil {
 			authOK := false
 			// Check the Proxy-Authorization header
