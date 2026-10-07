@@ -171,6 +171,7 @@ masquerade:
     rewriteHost: true
     xForwarded: true
     insecure: true
+    flushInterval: -1ms
   string:
     content: aint nothin here
     headers:
@@ -180,3 +181,4 @@ masquerade:
   listenHTTP: :80
   listenHTTPS: :443
   forceHTTPS: true
+  advertisedQUICPort: 8443
