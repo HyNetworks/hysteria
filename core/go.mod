@@ -6,7 +6,7 @@ require (
 	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
 	github.com/stretchr/testify v1.12.1
 	go.uber.org/goleak v1.3.0
-	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
+	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc
 	golang.org/x/time v0.15.0
 )
 
