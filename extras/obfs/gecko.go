@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // Gecko adds shape obfuscation on top of Salamander: QUIC long-header
@@ -49,7 +51,14 @@ func WrapPacketConnGecko(conn net.PacketConn, opts GeckoOptions) (net.PacketConn
 	if err != nil {
 		return nil, err
 	}
-	return newGeckoPacketConn(inner, minPkt, maxPkt), nil
+	g := newGeckoPacketConn(inner, minPkt, maxPkt)
+	if oobConn, ok := inner.(oobCapablePacketConn); ok {
+		return &geckoPacketConnOOB{
+			geckoPacketConn: g,
+			innerOOB:        oobConn,
+		}, nil
+	}
+	return g, nil
 }
 
 type reassemblyKey struct {
@@ -81,6 +90,11 @@ type geckoPacketConn struct {
 	closeOnce sync.Once
 }
 
+type geckoPacketConnOOB struct {
+	*geckoPacketConn
+	innerOOB oobCapablePacketConn
+}
+
 func newGeckoPacketConn(inner net.PacketConn, minPkt, maxPkt int) *geckoPacketConn {
 	g := &geckoPacketConn{
 		inner:      inner,
@@ -110,6 +124,13 @@ func (g *geckoPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 }
 
 func (g *geckoPacketConn) writeFragmented(p []byte, addr net.Addr) (int, error) {
+	return g.writeFragmentedWith(p, func(buf []byte) error {
+		_, err := g.inner.WriteTo(buf, addr)
+		return err
+	})
+}
+
+func (g *geckoPacketConn) writeFragmentedWith(p []byte, write func([]byte) error) (int, error) {
 	chunks := randomFragmentChunks()
 	chunkSize := len(p) / chunks
 	msgID := uint8(g.msgID.Add(1))
@@ -131,7 +152,7 @@ func (g *geckoPacketConn) writeFragmented(p []byte, addr net.Addr) (int, error) 
 		if err != nil {
 			return 0, err
 		}
-		if _, err := g.inner.WriteTo(buf[:n], addr); err != nil {
+		if err := write(buf[:n]); err != nil {
 			return 0, err
 		}
 	}
@@ -338,4 +359,61 @@ func (g *geckoPacketConn) SetWriteBuffer(bytes int) error {
 		return u.SetWriteBuffer(bytes)
 	}
 	return errors.ErrUnsupported
+}
+
+func (g *geckoPacketConnOOB) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	g.readMu.Lock()
+	defer g.readMu.Unlock()
+	buf := g.readBuf
+	for {
+		n, oobn, flags, addr, err = g.innerOOB.ReadMsgUDP(buf, oob)
+		if err != nil {
+			return 0, oobn, flags, addr, err
+		}
+		if n <= 0 {
+			continue
+		}
+		// Top bit set means Gecko fragment frame; clear means short-header
+		// packet or garbage, passed through for QUIC to handle.
+		if buf[0]&0x80 == 0 {
+			return copy(b, buf[:n]), oobn, flags, addr, nil
+		}
+		h, payload, decErr := decodeFrame(buf[:n])
+		if decErr != nil {
+			// Malformed frame; drop silently.
+			continue
+		}
+		out, ready := g.acceptChunk(addr, h, payload)
+		if !ready {
+			continue
+		}
+		return copy(b, out), oobn, flags, addr, nil
+	}
+}
+
+func (g *geckoPacketConnOOB) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	if len(b) == 0 {
+		return 0, 0, nil
+	}
+	if b[0]&0x80 != 0 {
+		return g.writeFragmentedMsg(b, oob, addr)
+	}
+	n, oobn, err = g.innerOOB.WriteMsgUDP(b, oob, addr)
+	if err == nil {
+		n = len(b)
+	}
+	return n, oobn, err
+}
+
+func (g *geckoPacketConnOOB) writeFragmentedMsg(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	n, err = g.writeFragmentedWith(b, func(buf []byte) error {
+		var writeErr error
+		_, oobn, writeErr = g.innerOOB.WriteMsgUDP(buf, oob, addr)
+		return writeErr
+	})
+	return n, oobn, err
+}
+
+func (g *geckoPacketConnOOB) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+	return readBatchOne(g, ms, flags)
 }
