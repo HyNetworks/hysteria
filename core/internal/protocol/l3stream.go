@@ -38,13 +38,36 @@ func WriteL3StreamHello(w io.Writer, dir, lane uint8) error {
 
 // WriteL3Frame writes one length-prefixed IP packet.
 func WriteL3Frame(w io.Writer, pkt []byte) error {
-	if len(pkt) == 0 || len(pkt) > L3StreamPayloadMax {
-		return errors.ProtocolError{Message: "invalid l3 frame"}
+	buf, err := AppendL3Frame(nil, pkt)
+	if err != nil {
+		return err
 	}
-	buf := make([]byte, 2+len(pkt))
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(pkt)))
-	copy(buf[2:], pkt)
 	return writeFull(w, buf)
+}
+
+// L3FrameWriter writes length-prefixed IP packets through one reused buffer.
+// A lane writer owns one, so a packet costs no allocation.
+type L3FrameWriter struct {
+	buf []byte
+}
+
+// Write writes one length-prefixed IP packet to w.
+func (fw *L3FrameWriter) Write(w io.Writer, pkt []byte) error {
+	buf, err := AppendL3Frame(fw.buf[:0], pkt)
+	if err != nil {
+		return err
+	}
+	fw.buf = buf
+	return writeFull(w, buf)
+}
+
+// AppendL3Frame appends one length-prefixed IP packet to dst.
+func AppendL3Frame(dst []byte, pkt []byte) ([]byte, error) {
+	if len(pkt) == 0 || len(pkt) > L3StreamPayloadMax {
+		return dst, errors.ProtocolError{Message: "invalid l3 frame"}
+	}
+	dst = binary.BigEndian.AppendUint16(dst, uint16(len(pkt)))
+	return append(dst, pkt...), nil
 }
 
 // ReadL3Frame reads one length-prefixed IP packet.

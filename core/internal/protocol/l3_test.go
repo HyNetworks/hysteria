@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"net/http"
 	"testing"
 )
@@ -46,5 +47,34 @@ func TestL3HeaderRoundTrip(t *testing.T) {
 	resp := AuthResponseFromHeader(h)
 	if !resp.L3 || !resp.UDPEnabled {
 		t.Fatalf("response = %+v", resp)
+	}
+}
+
+func TestL3FrameWriterReusesBuffer(t *testing.T) {
+	var fw L3FrameWriter
+	var out bytes.Buffer
+	for _, pkt := range [][]byte{bytes.Repeat([]byte{1}, 1500), {2, 3}} {
+		if err := fw.Write(&out, pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, want := range [][]byte{bytes.Repeat([]byte{1}, 1500), {2, 3}} {
+		got, err := ReadL3Frame(&out)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("frame = %d bytes, err %v", len(got), err)
+		}
+	}
+	if err := fw.Write(&out, nil); err == nil {
+		t.Fatal("empty frame was written")
+	}
+}
+
+func TestNormalizeL3ModeHybrid(t *testing.T) {
+	mode, err := NormalizeL3Mode(" Hybrid ")
+	if err != nil || mode != L3ModeHybrid || !L3UsesStreams(mode) {
+		t.Fatalf("mode = %q err %v", mode, err)
+	}
+	if L3UsesStreams(L3ModeDatagram) {
+		t.Fatal("datagram mode opens streams")
 	}
 }

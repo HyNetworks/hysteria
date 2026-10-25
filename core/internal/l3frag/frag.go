@@ -58,7 +58,8 @@ func (a *Assembler) Feed(packetID uint32, fragID, fragCount uint8, payload []byt
 		return nil
 	}
 	s.got[fragID] = true
-	s.data[fragID] = append([]byte(nil), payload...)
+	// The slot keeps its buffers; the packet returned below is a fresh copy.
+	s.data[fragID] = append(s.data[fragID][:0], payload...)
 	s.total += len(payload)
 	s.received++
 	if s.received != int(s.fragCount) {
@@ -72,13 +73,22 @@ func (a *Assembler) Feed(packetID uint32, fragID, fragCount uint8, payload []byt
 	return out
 }
 
+// reset starts a new packet in s and reuses the slices of the previous one,
+// so a steady stream of split packets does not allocate per fragment.
 func (s *slot) reset(id uint32, fragCount uint8, now time.Time) {
-	*s = slot{
-		id:        id,
-		fragCount: fragCount,
-		got:       make([]bool, fragCount),
-		data:      make([][]byte, fragCount),
-		started:   now,
-		active:    true,
+	n := int(fragCount)
+	if cap(s.got) < n {
+		s.got = make([]bool, n)
+		s.data = make([][]byte, n)
+	} else {
+		s.got = s.got[:n]
+		clear(s.got)
+		s.data = s.data[:n]
 	}
+	s.id = id
+	s.fragCount = fragCount
+	s.received = 0
+	s.total = 0
+	s.started = now
+	s.active = true
 }

@@ -19,6 +19,9 @@ const (
 
 	L3ModeDatagram = "datagram"
 	L3ModeStream   = "stream"
+	// L3ModeHybrid is a local sending policy, not a wire mode. It negotiates
+	// stream, then sends inner TCP on the lanes and everything else as datagrams.
+	L3ModeHybrid = "hybrid"
 
 	StatusAuthOK = 233
 )

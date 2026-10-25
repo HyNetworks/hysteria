@@ -11,6 +11,7 @@ import (
 	"github.com/apernet/quic-go"
 
 	coreErrs "github.com/apernet/hysteria/core/v2/errors"
+	"github.com/apernet/hysteria/core/v2/internal/l3"
 	"github.com/apernet/hysteria/core/v2/internal/l3frag"
 	"github.com/apernet/hysteria/core/v2/internal/l3stream"
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
@@ -26,12 +27,14 @@ const pipeQueue = 128
 // A lost packet is retransmitted by QUIC before the next packet of that flow
 // is delivered. Other flows keep moving.
 type l3StreamEndpoint struct {
-	conn *quic.Conn
-	asm  l3frag.Assembler
-	recv chan []byte
-	up   []chan []byte
-	done chan struct{}
-	once sync.Once
+	conn   *quic.Conn
+	asm    l3frag.Assembler
+	dg     l3.Sender
+	hybrid bool // inner TCP on the lanes, everything else as datagrams
+	recv   chan []byte
+	up     []chan []byte
+	done   chan struct{}
+	once   sync.Once
 
 	debug    bool
 	upSent   atomic.Uint64
@@ -40,15 +43,17 @@ type l3StreamEndpoint struct {
 	upErr    atomic.Uint64
 	downErr  atomic.Uint64
 	drops    atomic.Uint64
+	dgrams   atomic.Uint64
 }
 
-func openL3Streams(conn *quic.Conn, _ int) (*l3StreamEndpoint, error) {
+func openL3Streams(conn *quic.Conn, hybrid bool) (*l3StreamEndpoint, error) {
 	ep := &l3StreamEndpoint{
-		conn:  conn,
-		recv:  make(chan []byte, pipeQueue),
-		up:    make([]chan []byte, protocol.L3PipeLanes),
-		done:  make(chan struct{}),
-		debug: os.Getenv("HYSTERIA_L3_DEBUG") == "1",
+		conn:   conn,
+		hybrid: hybrid,
+		recv:   make(chan []byte, pipeQueue),
+		up:     make([]chan []byte, protocol.L3PipeLanes),
+		done:   make(chan struct{}),
+		debug:  os.Getenv("HYSTERIA_L3_DEBUG") == "1",
 	}
 	for i := range ep.up {
 		ep.up[i] = make(chan []byte, pipeQueue)
@@ -70,6 +75,14 @@ func (e *l3StreamEndpoint) Send(ipPkt []byte) error {
 	if len(ipPkt) == 0 || len(ipPkt) > protocol.L3MaxPacketSize {
 		return nil
 	}
+	if e.sendsDatagram(ipPkt) {
+		// A failure here is a dropped packet. A dead connection ends the
+		// datagram loop, which closes this endpoint.
+		if e.dg.Send(e.conn.SendDatagram, ipPkt) == nil {
+			e.dgrams.Add(1)
+		}
+		return nil
+	}
 	pkt := append([]byte(nil), ipPkt...)
 	lane := l3stream.Lane(pkt, protocol.L3PipeLanes)
 	select {
@@ -81,6 +94,16 @@ func (e *l3StreamEndpoint) Send(ipPkt []byte) error {
 		e.drops.Add(1)
 		return nil
 	}
+}
+
+// sendsDatagram picks the unreliable path. Download ACKs ride the lossy
+// uplink, so a pure ACK always goes as a datagram, like the server does for
+// upload ACKs. Hybrid sends everything but inner TCP data that way too.
+func (e *l3StreamEndpoint) sendsDatagram(pkt []byte) bool {
+	if e.hybrid {
+		return l3stream.Datagram(pkt)
+	}
+	return l3stream.PureACK(pkt)
 }
 
 func (e *l3StreamEndpoint) Receive() ([]byte, error) {
@@ -100,14 +123,15 @@ func (e *l3StreamEndpoint) debugLoop() {
 		case <-e.done:
 			return
 		case <-tick.C:
-			fmt.Fprintf(os.Stderr, "l3dbg client up=%d down=%d ack=%d upErr=%d downErr=%d drops=%d\n",
-				e.upSent.Load(), e.downSent.Load(), e.ackIn.Load(), e.upErr.Load(), e.downErr.Load(), e.drops.Load())
+			fmt.Fprintf(os.Stderr, "l3dbg client up=%d down=%d ack=%d upErr=%d downErr=%d drops=%d dgrams=%d\n",
+				e.upSent.Load(), e.downSent.Load(), e.ackIn.Load(), e.upErr.Load(), e.downErr.Load(), e.drops.Load(), e.dgrams.Load())
 		}
 	}
 }
 
-// feedDatagram reassembles an unreliable pure ACK and delivers it on the
-// same path as stream packets. A duplicate or older ACK is left for TCP.
+// feedDatagram reassembles a packet the server sent as a datagram and
+// delivers it on the same path as stream packets. It runs on the datagram
+// reader shared with UDP sessions, so a full queue drops the packet.
 func (e *l3StreamEndpoint) feedDatagram(frag protocol.L3Fragment) {
 	pkt := e.asm.Feed(frag.PacketID, frag.FragID, frag.FragCount, frag.Data)
 	if pkt == nil {
@@ -117,6 +141,8 @@ func (e *l3StreamEndpoint) feedDatagram(frag protocol.L3Fragment) {
 	case <-e.done:
 	case e.recv <- pkt:
 		e.ackIn.Add(1)
+	default:
+		e.drops.Add(1)
 	}
 }
 
@@ -125,6 +151,7 @@ func (e *l3StreamEndpoint) close() {
 }
 
 func (e *l3StreamEndpoint) uplinkLane(i int) {
+	var fw protocol.L3FrameWriter
 	var pending []byte
 	for {
 		stream, stop := e.openLane(protocol.L3StreamUplink, uint8(i))
@@ -135,7 +162,7 @@ func (e *l3StreamEndpoint) uplinkLane(i int) {
 			continue
 		}
 		var closed bool
-		pending, closed = e.writeLane(stream, e.up[i], pending)
+		pending, closed = e.writeLane(stream, e.up[i], pending, &fw)
 		stream.CancelWrite(0)
 		stream.CancelRead(0)
 		if closed {
@@ -145,7 +172,7 @@ func (e *l3StreamEndpoint) uplinkLane(i int) {
 	}
 }
 
-func (e *l3StreamEndpoint) writeLane(stream *quic.Stream, q chan []byte, pending []byte) ([]byte, bool) {
+func (e *l3StreamEndpoint) writeLane(stream *quic.Stream, q chan []byte, pending []byte, fw *protocol.L3FrameWriter) ([]byte, bool) {
 	for {
 		if pending == nil {
 			select {
@@ -154,7 +181,7 @@ func (e *l3StreamEndpoint) writeLane(stream *quic.Stream, q chan []byte, pending
 			case pending = <-q:
 			}
 		}
-		if err := protocol.WriteL3Frame(stream, pending); err != nil {
+		if err := fw.Write(stream, pending); err != nil {
 			return pending, false
 		}
 		e.upSent.Add(1)

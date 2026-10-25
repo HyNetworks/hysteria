@@ -20,7 +20,8 @@ const l3RecvQueue = 2048
 
 // HyL3Conn is the single L3 peer binding for this server.
 // Send drops the packet when no client is bound. Receive waits for the next
-// reassembled IP packet from the current peer.
+// reassembled IP packet from the current peer. Send does not keep ipPkt
+// after it returns, so the caller may reuse it.
 type HyL3Conn interface {
 	Send(ipPkt []byte) error
 	Receive() ([]byte, error)
@@ -42,11 +43,12 @@ func newL3Hub() *l3Hub {
 	}
 }
 
-// adopt binds conn as the L3 peer. stream adds the downlink lane writers.
+// adopt binds conn as the L3 peer. A stream or hybrid mode adds the downlink
+// lane writers; hybrid also sends everything but inner TCP as datagrams.
 // A live peer with another auth ID keeps the binding and adopt returns nil,
 // so one user cannot take over another user's tunnel. A peer with the same
 // auth ID is replaced and its connection is closed, so a stale client notices.
-func (h *l3Hub) adopt(conn *quic.Conn, authID string, tl TrafficLogger, stream bool) *l3Peer {
+func (h *l3Hub) adopt(conn *quic.Conn, authID string, tl TrafficLogger, mode string) *l3Peer {
 	p := &l3Peer{
 		hub:    h,
 		conn:   conn,
@@ -55,8 +57,9 @@ func (h *l3Hub) adopt(conn *quic.Conn, authID string, tl TrafficLogger, stream b
 		alive: func() bool {
 			return conn != nil && conn.Context().Err() == nil
 		},
+		hybrid: mode == protocol.L3ModeHybrid,
 	}
-	if stream {
+	if protocol.L3UsesStreams(mode) {
 		p.down = newDownLink()
 	}
 	h.mu.Lock()
@@ -174,8 +177,9 @@ type l3Peer struct {
 	tl     TrafficLogger
 	alive  func() bool
 	asm    l3frag.Assembler
-	next   atomic.Uint32
+	dg     l3.Sender
 	down   *downLink // set before the peer is published, never changed
+	hybrid bool
 }
 
 // release stops the downlink writers of a peer that was never bound.
@@ -194,24 +198,31 @@ func (p *l3Peer) evict() {
 }
 
 func (p *l3Peer) send(ip []byte) error {
-	if p.down != nil {
-		// Upload ACKs travel the lossy downlink. A reliable stream would hold
-		// every later ACK behind one retransmission. A pure ACK is cumulative,
-		// so losing it is harmless and it goes out as a datagram instead.
-		if l3stream.PureACK(ip) {
-			if err := l3.Send(p.conn.SendDatagram, &p.next, ip); err != nil {
-				return nil
-			}
-			if l3AckDup {
-				_ = l3.Send(p.conn.SendDatagram, &p.next, ip)
-			}
-			p.down.acks.Add(1)
-			return nil
-		}
+	if p.down == nil {
+		return p.dg.Send(p.conn.SendDatagram, ip)
+	}
+	// Upload ACKs travel the lossy downlink. A reliable stream would hold
+	// every later ACK behind one retransmission. A pure ACK is cumulative,
+	// so losing it is harmless and it goes out as a datagram instead.
+	// Hybrid sends every packet that is not inner TCP data the same way.
+	var dgram bool
+	if p.hybrid {
+		dgram = l3stream.Datagram(ip)
+	} else {
+		dgram = l3stream.PureACK(ip)
+	}
+	if !dgram {
 		p.down.send(ip)
 		return nil
 	}
-	return l3.Send(p.conn.SendDatagram, &p.next, ip)
+	if err := p.dg.Send(p.conn.SendDatagram, ip); err != nil {
+		return nil
+	}
+	if l3AckDup && l3stream.PureACK(ip) {
+		_ = p.dg.Send(p.conn.SendDatagram, ip)
+	}
+	p.down.dgrams.Add(1)
+	return nil
 }
 
 var l3AckDup = os.Getenv("HYSTERIA_L3_ACK_DUP") == "1"
@@ -235,15 +246,15 @@ const pipeQueue = 128
 // downLink writes each inner flow to the client-opened stream selected by
 // its VXLAN source port. QUIC retransmits a lost packet on that stream.
 type downLink struct {
-	lanes []chan []byte
-	gen   []atomic.Uint64
-	done  chan struct{}
-	once  sync.Once
-	debug bool
-	sent  atomic.Uint64
-	acks  atomic.Uint64
-	errs  atomic.Uint64
-	drops atomic.Uint64
+	lanes  []chan []byte
+	gen    []atomic.Uint64
+	done   chan struct{}
+	once   sync.Once
+	debug  bool
+	sent   atomic.Uint64
+	dgrams atomic.Uint64
+	errs   atomic.Uint64
+	drops  atomic.Uint64
 }
 
 func newDownLink() *downLink {
@@ -270,7 +281,7 @@ func (d *downLink) debugLoop() {
 		case <-d.done:
 			return
 		case <-tick.C:
-			fmt.Fprintf(os.Stderr, "l3dbg server sent=%d acks=%d errs=%d drops=%d\n", d.sent.Load(), d.acks.Load(), d.errs.Load(), d.drops.Load())
+			fmt.Fprintf(os.Stderr, "l3dbg server sent=%d dgrams=%d errs=%d drops=%d\n", d.sent.Load(), d.dgrams.Load(), d.errs.Load(), d.drops.Load())
 		}
 	}
 }
@@ -312,6 +323,7 @@ func (d *downLink) writeLane(idx int, gen uint64, stream *quic.Stream) {
 		stream.CancelWrite(0)
 	}()
 	q := d.lanes[idx]
+	var fw protocol.L3FrameWriter
 	var pending []byte
 	for d.gen[idx].Load() == gen {
 		if pending == nil {
@@ -325,7 +337,7 @@ func (d *downLink) writeLane(idx int, gen uint64, stream *quic.Stream) {
 			d.returnPkt(q, pending)
 			return
 		}
-		if err := protocol.WriteL3Frame(stream, pending); err != nil {
+		if err := fw.Write(stream, pending); err != nil {
 			d.errs.Add(1)
 			return
 		}

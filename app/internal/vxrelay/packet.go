@@ -17,6 +17,9 @@ const (
 )
 
 // Wrap builds an outer IP/UDP packet whose payload is one VXLAN datagram.
+// Over IPv4 the UDP checksum is left at zero, as RFC 7348 recommends: QUIC
+// already authenticates every byte, and summing 1.5 KB per packet buys nothing.
+// IPv6 requires a checksum, so it is computed there.
 // The UDP destination port is always 4789, which is what a kernel VTEP listens on.
 // sport selects the QUIC stream lane. The result is nil when it would exceed
 // the tunnel ceiling or the addresses are not a matching pair.
@@ -49,7 +52,7 @@ func wrap4(src, dst netip.Addr, sport uint16, vxlan []byte) []byte {
 	copy(pkt[12:16], src4[:])
 	copy(pkt[16:20], dst4[:])
 	binary.BigEndian.PutUint16(pkt[10:12], checksum(sumBytes(0, pkt[:ipv4Header])))
-	putUDP(pkt[ipv4Header:], src, dst, sport, vxlan)
+	putUDP(pkt[ipv4Header:], sport, vxlan)
 	return pkt
 }
 
@@ -66,21 +69,24 @@ func wrap6(src, dst netip.Addr, sport uint16, vxlan []byte) []byte {
 	src6, dst6 := src.As16(), dst.As16()
 	copy(pkt[8:24], src6[:])
 	copy(pkt[24:40], dst6[:])
-	putUDP(pkt[ipv6Header:], src, dst, sport, vxlan)
+	udp := pkt[ipv6Header:]
+	putUDP(udp, sport, vxlan)
+	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(src, dst, udp))
 	return pkt
 }
 
-func putUDP(udp []byte, src, dst netip.Addr, sport uint16, payload []byte) {
+// putUDP writes the UDP header with a zero checksum, then the payload.
+func putUDP(udp []byte, sport uint16, payload []byte) {
 	binary.BigEndian.PutUint16(udp[0:2], sport)
 	binary.BigEndian.PutUint16(udp[2:4], vxlanPort)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(udpHeader+len(payload)))
 	copy(udp[udpHeader:], payload)
-	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(src, dst, udp))
 }
 
 // Unwrap checks that pkt is a UDP datagram for this relay: the source is peer,
 // the destination is local, the destination port is 4789, and the payload is
-// VXLAN with the I bit set. payload aliases pkt.
+// VXLAN with the I bit set. payload aliases pkt. The UDP checksum is not
+// verified: the packet came out of an authenticated QUIC connection.
 func Unwrap(pkt []byte, local, peer netip.Addr) (payload []byte, vni uint32, ok bool) {
 	udp, ok := udpPayload(pkt, local.Unmap(), peer.Unmap())
 	if !ok {
@@ -166,15 +172,6 @@ func udpPayload(pkt []byte, local, peer netip.Addr) ([]byte, bool) {
 		return nil, false
 	}
 	if binary.BigEndian.Uint16(udp[2:4]) != vxlanPort {
-		return nil, false
-	}
-	got := binary.BigEndian.Uint16(udp[6:8])
-	if got == 0 {
-		// IPv4 may leave the checksum empty. IPv6 must not.
-		if pkt[0]>>4 == 6 {
-			return nil, false
-		}
-	} else if got != udpChecksum(peer, local, udp[:length]) {
 		return nil, false
 	}
 	return udp[udpHeader:length], true

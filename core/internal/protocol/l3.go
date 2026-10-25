@@ -43,6 +43,20 @@ func ParseL3Fragment(msg []byte) (L3Fragment, bool) {
 	}, true
 }
 
+// L3FragmentCount is how many even pieces an IP packet of size n needs so each
+// fits in maxDatagram. It returns 0 when the packet cannot be carried.
+func L3FragmentCount(n, maxDatagram int) int {
+	if n <= 0 || n > L3MaxPacketSize || maxDatagram <= L3HeaderSize {
+		return 0
+	}
+	maxPayload := maxDatagram - L3HeaderSize
+	count := (n + maxPayload - 1) / maxPayload
+	if count > 255 {
+		return 0
+	}
+	return count
+}
+
 // AppendL3Fragment appends one L3 datagram to dst.
 func AppendL3Fragment(dst []byte, packetID uint32, fragID, fragCount uint8, data []byte) []byte {
 	var hdr [L3HeaderSize]byte
@@ -59,12 +73,8 @@ func AppendL3Fragment(dst []byte, packetID uint32, fragID, fragCount uint8, data
 // maxDatagram is the largest QUIC datagram payload the peer currently accepts.
 // It returns nil when the packet cannot be carried.
 func SplitL3(packetID uint32, ip []byte, maxDatagram int) [][]byte {
-	if len(ip) == 0 || len(ip) > L3MaxPacketSize || maxDatagram <= L3HeaderSize {
-		return nil
-	}
-	maxPayload := maxDatagram - L3HeaderSize
-	count := (len(ip) + maxPayload - 1) / maxPayload
-	if count == 0 || count > 255 {
+	count := L3FragmentCount(len(ip), maxDatagram)
+	if count == 0 {
 		return nil
 	}
 	base := len(ip) / count

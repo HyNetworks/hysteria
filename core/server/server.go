@@ -229,14 +229,19 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			l3Lanes := 0
 			if grantL3 {
 				l3Mode = protocol.L3ModeDatagram
-				if h.config.L3Mode == protocol.L3ModeStream && authReq.L3Mode == protocol.L3ModeStream {
+				if protocol.L3UsesStreams(h.config.L3Mode) && authReq.L3Mode == protocol.L3ModeStream {
 					l3Mode = protocol.L3ModeStream
 					l3Lanes = protocol.NormalizeL3Lanes(authReq.L3Lanes)
 				}
 			}
 			var peer *l3Peer
 			if grantL3 {
-				peer = h.l3.adopt(h.conn, id, h.config.TrafficLogger, l3Mode == protocol.L3ModeStream)
+				// The wire says stream. Whether to split by inner protocol is this end's choice.
+				policy := l3Mode
+				if l3Mode == protocol.L3ModeStream {
+					policy = h.config.L3Mode
+				}
+				peer = h.l3.adopt(h.conn, id, h.config.TrafficLogger, policy)
 				grantL3 = peer != nil
 			}
 			if !grantL3 {

@@ -21,7 +21,7 @@ const (
 	vxlanPort    = 4789
 )
 
-// L3Conn is the QUIC side of a raw IP tunnel.
+// L3Conn is the QUIC side of a raw IP tunnel. Send does not keep ipPkt.
 type L3Conn interface {
 	Send(ipPkt []byte) error
 	Receive() ([]byte, error)
@@ -202,8 +202,8 @@ func (r *Raw) readLoop(dev stun.Tun, conn L3Conn) error {
 		if len(ip) > int(r.MTU) {
 			continue
 		}
-		pkt := append([]byte(nil), ip...)
-		if err := conn.Send(pkt); err != nil {
+		// Send does not keep the slice, so buf is reused for the next read.
+		if err := conn.Send(ip); err != nil {
 			if r.isClosed() {
 				return nil
 			}

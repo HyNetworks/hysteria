@@ -92,9 +92,9 @@ func (c *Config) verifyAndFill() error {
 	if c.RequestL3 {
 		c.L3Mode, err = protocol.NormalizeL3Mode(c.L3Mode)
 		if err != nil {
-			return errors.ConfigError{Field: "L3Mode", Reason: "must be datagram or stream"}
+			return errors.ConfigError{Field: "L3Mode", Reason: "must be datagram, stream or hybrid"}
 		}
-		if c.L3Mode == protocol.L3ModeStream {
+		if protocol.L3UsesStreams(c.L3Mode) {
 			c.L3Lanes = protocol.NormalizeL3Lanes(c.L3Lanes)
 		}
 	}

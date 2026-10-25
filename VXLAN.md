@@ -11,13 +11,22 @@ VXLAN 网卡有两种放法，配置里用 `l3tun.type` 切换。省略 `type` �
 
 两端都要写 `l3tun`。客户端写了，认证请求里才带 `Hysteria-L3`。服务端写了，才会同意。缺任意一侧，这条通道不会通。旧版 Hysteria 不认识这种包，会直接丢掉。
 
-`mode` 省略是 `datagram`：一颗 IP 包放进一条 QUIC datagram，路径装不下就切成均匀的几片，缺一片整包作废。`mode: stream` 把每个内层流放进自己的可靠 QUIC stream。外层 UDP 源端口决定落在 32 条里的哪一条，同一条流不拆开，其它流不被它挡住。丢了的包由 QUIC 重传。每条 lane 最多排 128 颗包，排满后新包直接丢弃，由内层 TCP 自己重传。这样一条被压住的流不会卡住其它 lane，排队延迟也有上限。配置里的 `lanes` 会放进认证头，流池大小固定是 32，不跟着这个数字变。
+`mode` 省略是 `datagram`：一颗 IP 包放进一条 QUIC datagram，路径装不下就切成均匀的几片，缺一片整包作废。`mode: stream` 把每个内层流放进自己的可靠 QUIC stream。外层 UDP 源端口决定落在 32 条里的哪一条，同一条流不拆开，其它流不被它挡住。丢了的包由 QUIC 重传。每条 lane 最多排 128 颗包，排满后新包直接丢弃，由内层 TCP 自己重传。这样一条被压住的流不会卡住其它 lane，排队延迟也有上限。配置里的 `lanes` 会放进认证头，流池大小固定是 32，不跟着这个数字变。stream 模式下，内层 TCP 的纯 ACK 两个方向都走 datagram：ACK 是累积的，丢一颗没关系，也不会排在一次重传后面。
 
 ```yaml
 l3tun:
   mode: stream
   lanes: 8
 ```
+
+`mode: hybrid` 按内层协议分流。内层 TCP 的数据段留在 stream lane 上，由 QUIC 重传。其它包，包括 UDP、ICMP、ARP 和纯 ACK，都走 datagram：丢一颗只损失这一颗，后面的包不用等它重传。VoIP、游戏，以及内层再跑 QUIC 或 WireGuard 时，适合用这个模式。握手时它按 stream 协商，所以对端写 `stream` 或 `hybrid` 都能通。两端各自决定自己发出去的包怎么分。走 datagram 的足额包和 datagram 模式一样，大约 1550 字节时会切成两片。
+
+```yaml
+l3tun:
+  mode: hybrid
+```
+
+datagram 路径会记住路径能装下的最大 datagram，超过的包直接切片，不用每颗都先试一次再失败。每 256 颗需要切片的包会整包试一次，路径 MTU 变大以后能发现。
 
 ## 本机网卡
 
@@ -141,6 +150,8 @@ Hysteria 不创建 `hytun0`。它在 `relay.listen` 上收 UDP，把 VXLAN 载�
 每个 VNI 对应一个 VTEP。表里没有的 VNI，两个方向都丢。从局域网进来的包，源地址必须等于该 VNI 的 `vtep`，或者落在 `allow` 里。回去的包总是发到配置的那个 `vtep`，不写端口时用 4789。一个 VNI 只写一个回程地址。换了发送 VXLAN 的机器，就要改两端的 `vtep`，然后按下面的热重载换表，不用重启。只改一边时，另一边仍按旧表转发。
 
 外层 UDP 源端口不沿用 VTEP 原来的端口。有的 VTEP 所有流都用同一个端口，会挤进同一条 QUIC stream。中继按内层以太网帧里的 IP 流重新取源端口。
+
+补出来的 IPv4 外层 UDP 校验和是 0（RFC 7348 允许），对端收到时也不检查校验和。这一段已经由 QUIC 加密和认证，再对 1.5 KB 的包算一遍校验和没有意义。IPv6 要求必须带校验和，所以照常计算。
 
 ```text
 本地 VTEP
@@ -366,7 +377,7 @@ l3tun:
 | `mtu` | 省略为 1600，上限 1600 | 不使用 |
 | `address` | 本端前缀，程序配置到网卡上 | 写进外层 IP 头，前缀或单个地址 |
 | `peer` | 对端地址 | 外层 IP 的目的地址，和对端 `address` 成对 |
-| `mode` | `datagram` 或 `stream` | 相同 |
+| `mode` | `datagram`、`stream` 或 `hybrid` | 相同 |
 | `relay.listen` | 无 | 本机网卡地址加端口 |
 | `relay.vnis[].vni` | 无。VNI 由内核 VXLAN 区分 | 1 到 16777215，不能重复 |
 | `relay.vnis[].vtep` | 无 | 这个 VNI 的回程 `主机:端口`，端口可省略 |

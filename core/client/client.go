@@ -31,6 +31,7 @@ type Client interface {
 }
 
 // HyL3Conn carries whole IP packets across the QUIC connection.
+// Send does not keep ipPkt after it returns, so the caller may reuse it.
 type HyL3Conn interface {
 	Send(ipPkt []byte) error
 	Receive() ([]byte, error)
@@ -146,7 +147,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		Rx:   c.config.BandwidthConfig.MaxRx,
 		L3:   c.config.RequestL3,
 	}
-	if c.config.RequestL3 && c.config.L3Mode == protocol.L3ModeStream {
+	if c.config.RequestL3 && protocol.L3UsesStreams(c.config.L3Mode) {
 		authReq.L3Mode = protocol.L3ModeStream
 		authReq.L3Lanes = protocol.NormalizeL3Lanes(c.config.L3Lanes)
 	}
@@ -198,12 +199,8 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 			c.udpSM = newFedUDPSessionManager(&udpIOImpl{Conn: conn})
 		}
 		if authResp.L3 {
-			if c.config.L3Mode == protocol.L3ModeStream && authResp.L3Mode == protocol.L3ModeStream {
-				lanes := authResp.L3Lanes
-				if lanes <= 0 {
-					lanes = c.config.L3Lanes
-				}
-				ep, err := openL3Streams(conn, lanes)
+			if protocol.L3UsesStreams(c.config.L3Mode) && authResp.L3Mode == protocol.L3ModeStream {
+				ep, err := openL3Streams(conn, c.config.L3Mode == protocol.L3ModeHybrid)
 				if err != nil {
 					_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 					_ = tr.Close()
@@ -219,8 +216,11 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	}
 	mode := ""
 	if c.l3 != nil {
-		if _, stream := c.l3.(*l3StreamEndpoint); stream {
+		if ep, stream := c.l3.(*l3StreamEndpoint); stream {
 			mode = protocol.L3ModeStream
+			if ep.hybrid {
+				mode = protocol.L3ModeHybrid
+			}
 		} else {
 			mode = protocol.L3ModeDatagram
 		}

@@ -115,3 +115,25 @@ func TestRejectsOversizedAndBadCount(t *testing.T) {
 		t.Fatal("accepted a mismatched fragment count")
 	}
 }
+
+func TestSlotReuseKeepsPacketsApart(t *testing.T) {
+	var a Assembler
+	pktA := bytes.Repeat([]byte{0xaa}, 1500)
+	pktB := bytes.Repeat([]byte{0xbb}, 900)
+	var gotA []byte
+	for i, f := range frag(pktA, 2) {
+		if out := a.Feed(1, uint8(i), 2, f); out != nil {
+			gotA = out
+		}
+	}
+	// Packet 65 lands in the same slot with a different fragment count.
+	var gotB []byte
+	for i, f := range frag(pktB, 3) {
+		if out := a.Feed(65, uint8(i), 3, f); out != nil {
+			gotB = out
+		}
+	}
+	if !bytes.Equal(gotA, pktA) || !bytes.Equal(gotB, pktB) {
+		t.Fatalf("A ok %v, B ok %v", bytes.Equal(gotA, pktA), bytes.Equal(gotB, pktB))
+	}
+}

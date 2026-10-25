@@ -17,8 +17,8 @@ func TestWrapKnownChecksum(t *testing.T) {
 	if got := binary.BigEndian.Uint16(pkt[10:12]); got != 0x6537 {
 		t.Fatalf("ipv4 checksum = %04x, want 6537", got)
 	}
-	if got := binary.BigEndian.Uint16(pkt[26:28]); got != 0xab4b {
-		t.Fatalf("udp checksum = %04x, want ab4b", got)
+	if got := binary.BigEndian.Uint16(pkt[26:28]); got != 0 {
+		t.Fatalf("udp checksum = %04x, want 0 over ipv4", got)
 	}
 	payload, vni, ok := Unwrap(pkt, dst, src)
 	if !ok || vni != 500 || string(payload) != string(vxlan) {

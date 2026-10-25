@@ -2,7 +2,6 @@ package l3
 
 import (
 	"bytes"
-	"sync/atomic"
 	"testing"
 
 	"github.com/apernet/quic-go"
@@ -12,7 +11,7 @@ import (
 )
 
 func TestSendEvenSplitAndInterleavedReassembly(t *testing.T) {
-	var next atomic.Uint32
+	var s Sender
 	var datagrams [][]byte
 	send := func(b []byte) error {
 		if len(b) > 1200 {
@@ -23,10 +22,10 @@ func TestSendEvenSplitAndInterleavedReassembly(t *testing.T) {
 	}
 	pktA := bytes.Repeat([]byte{0x45}, 1600)
 	pktB := bytes.Repeat([]byte{0x60}, 1500)
-	if err := Send(send, &next, pktA); err != nil {
+	if err := s.Send(send, pktA); err != nil {
 		t.Fatal(err)
 	}
-	if err := Send(send, &next, pktB); err != nil {
+	if err := s.Send(send, pktB); err != nil {
 		t.Fatal(err)
 	}
 	if len(datagrams) != 4 {
@@ -63,5 +62,59 @@ func TestSendEvenSplitAndInterleavedReassembly(t *testing.T) {
 	}
 	if !bytes.Equal(gotA, pktA) || !bytes.Equal(gotB, pktB) {
 		t.Fatalf("reassembly A=%d B=%d", len(gotA), len(gotB))
+	}
+}
+
+func TestSenderRemembersPathLimit(t *testing.T) {
+	var s Sender
+	var calls, whole int
+	send := func(b []byte) error {
+		calls++
+		if len(b) > 1200 {
+			whole++
+			return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 1200}
+		}
+		return nil
+	}
+	pkt := bytes.Repeat([]byte{0x45}, 1500)
+	for i := 0; i < 3; i++ {
+		if err := s.Send(send, pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One failed whole attempt, then two pieces per packet.
+	if whole != 1 || calls != 1+3*2 {
+		t.Fatalf("whole = %d calls = %d", whole, calls)
+	}
+	if err := s.Send(send, []byte{0x45, 0x00}); err != nil || calls != 8 {
+		t.Fatalf("small packet: err %v calls %d", err, calls)
+	}
+}
+
+func TestSenderProbesForLargerPath(t *testing.T) {
+	var s Sender
+	limit := 1200
+	var whole int
+	send := func(b []byte) error {
+		if len(b) > limit {
+			return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(limit)}
+		}
+		if len(b) > 1200 {
+			whole++
+		}
+		return nil
+	}
+	pkt := bytes.Repeat([]byte{0x45}, 1500)
+	_ = s.Send(send, pkt)
+	limit = 1600 // the path MTU grew
+	for i := 0; i < probeEvery; i++ {
+		_ = s.Send(send, pkt)
+	}
+	if whole != 1 {
+		t.Fatalf("whole sends after growth = %d, want the probe", whole)
+	}
+	_ = s.Send(send, pkt)
+	if whole != 2 {
+		t.Fatal("limit was not forgotten after a successful probe")
 	}
 }

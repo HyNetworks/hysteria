@@ -27,6 +27,22 @@ func PureACK(pkt []byte) bool {
 	return tcpACKOnly(inner)
 }
 
+// Datagram reports whether hybrid mode sends pkt as an unreliable datagram.
+// Inner TCP stays on its reliable stream, except a pure ACK. Everything else,
+// such as UDP, ICMP and ARP, goes as a datagram: a lost packet costs only
+// itself, and a later one is not held behind its retransmission.
+// A packet that is not VXLAN is judged by its own protocol.
+func Datagram(pkt []byte) bool {
+	inner, ok := vxlanInner(pkt)
+	if !ok {
+		inner = pkt
+	}
+	if _, isTCP := tcpSegment(inner); !isTCP {
+		return true
+	}
+	return len(pkt) <= pureACKMax && tcpACKOnly(inner)
+}
+
 func vxlanInner(pkt []byte) ([]byte, bool) {
 	udp, ok := udpHeader(pkt)
 	if !ok || len(udp) < 8+8+14 {

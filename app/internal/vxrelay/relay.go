@@ -233,7 +233,8 @@ func (r *Relay) readLoop(udp *net.UDPConn, conn L3Conn) error {
 		if !ok || !entry.allows(addr.Addr().Unmap()) {
 			continue
 		}
-		pkt := Wrap(r.local, r.peer, FlowPort(vxlan, addr.Port()), append([]byte(nil), vxlan...))
+		// Wrap copies vxlan into a new packet, so buf is free for the next read.
+		pkt := Wrap(r.local, r.peer, FlowPort(vxlan, addr.Port()), vxlan)
 		if pkt == nil {
 			continue
 		}

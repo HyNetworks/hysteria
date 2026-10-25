@@ -23,8 +23,8 @@ func TestHubDropsWithoutPeer(t *testing.T) {
 
 func TestHubReplacesPeer(t *testing.T) {
 	h := newL3Hub()
-	old := h.adopt(nil, "old", nil, false)
-	cur := h.adopt(nil, "new", nil, false)
+	old := h.adopt(nil, "old", nil, protocol.L3ModeDatagram)
+	cur := h.adopt(nil, "new", nil, protocol.L3ModeDatagram)
 	if old == nil || cur == nil {
 		t.Fatal("adopt failed")
 	}
@@ -47,9 +47,9 @@ func TestHubReplacesPeer(t *testing.T) {
 
 func TestHubKeepsLivePeerOfAnotherUser(t *testing.T) {
 	h := newL3Hub()
-	owner := h.adopt(nil, "alice", nil, true)
+	owner := h.adopt(nil, "alice", nil, protocol.L3ModeStream)
 	owner.alive = func() bool { return true }
-	if p := h.adopt(nil, "mallory", nil, true); p != nil {
+	if p := h.adopt(nil, "mallory", nil, protocol.L3ModeStream); p != nil {
 		t.Fatal("another user took over a live tunnel")
 	}
 	if h.current() != owner {
@@ -64,9 +64,9 @@ func TestHubKeepsLivePeerOfAnotherUser(t *testing.T) {
 
 func TestHubSameUserReplacesAndEvicts(t *testing.T) {
 	h := newL3Hub()
-	old := h.adopt(nil, "alice", nil, true)
+	old := h.adopt(nil, "alice", nil, protocol.L3ModeStream)
 	old.alive = func() bool { return true }
-	cur := h.adopt(nil, "alice", nil, true)
+	cur := h.adopt(nil, "alice", nil, protocol.L3ModeStream)
 	if cur == nil || h.current() != cur {
 		t.Fatal("same user did not replace its stale peer")
 	}

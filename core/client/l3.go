@@ -2,7 +2,6 @@ package client
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/apernet/quic-go"
 
@@ -16,7 +15,7 @@ const l3RecvQueue = 128
 type l3Endpoint struct {
 	conn *quic.Conn
 	asm  l3frag.Assembler
-	next atomic.Uint32
+	dg   l3.Sender
 
 	recv chan []byte
 	done chan struct{}
@@ -37,7 +36,7 @@ func (e *l3Endpoint) Send(ipPkt []byte) error {
 		return coreErrs.ClosedError{}
 	default:
 	}
-	if err := l3.Send(e.conn.SendDatagram, &e.next, ipPkt); err != nil {
+	if err := e.dg.Send(e.conn.SendDatagram, ipPkt); err != nil {
 		return wrapIfConnectionClosed(err)
 	}
 	return nil

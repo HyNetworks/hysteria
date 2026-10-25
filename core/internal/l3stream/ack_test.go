@@ -101,3 +101,25 @@ func innerUDP() []byte {
 func pad(pkt []byte, n int) []byte {
 	return append(pkt, make([]byte, n)...)
 }
+
+func TestDatagram(t *testing.T) {
+	cases := []struct {
+		name string
+		pkt  []byte
+		want bool
+	}{
+		{"inner tcp data", wrapVXLAN(tcp4(0x10, 1, 0), 0x0800), false},
+		{"inner synack", wrapVXLAN(tcp4(0x12, 0, 0), 0x0800), false},
+		{"inner pure ack", wrapVXLAN(tcp4(0x10, 0, 0), 0x0800), true},
+		{"inner udp", wrapVXLAN(innerUDP(), 0x0800), true},
+		{"inner arp", wrapVXLAN(make([]byte, 28), 0x0806), true},
+		{"ipv6 tcp data", wrapVXLAN(tcp6(0x10, 8), 0x86dd), false},
+		{"bare tcp", tcp4(0x10, 1, 0), false},
+		{"bare udp", innerUDP(), true},
+	}
+	for _, tc := range cases {
+		if got := Datagram(tc.pkt); got != tc.want {
+			t.Errorf("%s: Datagram = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
