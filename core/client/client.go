@@ -329,7 +329,8 @@ func (c *clientImpl) UDP() (HyUDPConn, error) {
 
 func (c *clientImpl) L3() (HyL3Conn, error) {
 	if c.l3 == nil {
-		return nil, coreErrs.DialError{Message: "L3 not enabled"}
+		// The server has no l3tun, does not list this user, or another user holds the tunnel.
+		return nil, coreErrs.DialError{Message: "server did not grant L3"}
 	}
 	return c.l3, nil
 }

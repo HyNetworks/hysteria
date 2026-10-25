@@ -42,19 +42,40 @@ func newL3Hub() *l3Hub {
 	}
 }
 
-func (h *l3Hub) adopt(conn *quic.Conn, authID string, tl TrafficLogger) *l3Peer {
+// adopt binds conn as the L3 peer. stream adds the downlink lane writers.
+// A live peer with another auth ID keeps the binding and adopt returns nil,
+// so one user cannot take over another user's tunnel. A peer with the same
+// auth ID is replaced and its connection is closed, so a stale client notices.
+func (h *l3Hub) adopt(conn *quic.Conn, authID string, tl TrafficLogger, stream bool) *l3Peer {
 	p := &l3Peer{
 		hub:    h,
 		conn:   conn,
 		authID: authID,
 		tl:     tl,
+		alive: func() bool {
+			return conn != nil && conn.Context().Err() == nil
+		},
+	}
+	if stream {
+		p.down = newDownLink()
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
+		p.release()
+		return nil
+	}
+	old := h.cur
+	if old != nil && old.authID != authID && old.alive() {
+		h.mu.Unlock()
+		p.release()
 		return nil
 	}
 	h.cur = p
+	h.mu.Unlock()
+	if old != nil {
+		old.evict()
+	}
 	return p
 }
 
@@ -151,9 +172,25 @@ type l3Peer struct {
 	conn   *quic.Conn
 	authID string
 	tl     TrafficLogger
+	alive  func() bool
 	asm    l3frag.Assembler
 	next   atomic.Uint32
-	down   *downLink
+	down   *downLink // set before the peer is published, never changed
+}
+
+// release stops the downlink writers of a peer that was never bound.
+func (p *l3Peer) release() {
+	if p.down != nil {
+		p.down.close()
+	}
+}
+
+// evict closes a peer that a newer connection replaced.
+func (p *l3Peer) evict() {
+	p.release()
+	if p.conn != nil {
+		_ = p.conn.CloseWithError(closeErrCodeL3Replaced, "l3 tunnel taken over by a newer connection")
+	}
 }
 
 func (p *l3Peer) send(ip []byte) error {
@@ -165,7 +202,7 @@ func (p *l3Peer) send(ip []byte) error {
 			if err := l3.Send(p.conn.SendDatagram, &p.next, ip); err != nil {
 				return nil
 			}
-			if ackDup() {
+			if l3AckDup {
 				_ = l3.Send(p.conn.SendDatagram, &p.next, ip)
 			}
 			p.down.acks.Add(1)
@@ -177,9 +214,7 @@ func (p *l3Peer) send(ip []byte) error {
 	return l3.Send(p.conn.SendDatagram, &p.next, ip)
 }
 
-func ackDup() bool {
-	return os.Getenv("HYSTERIA_L3_ACK_DUP") == "1"
-}
+var l3AckDup = os.Getenv("HYSTERIA_L3_ACK_DUP") == "1"
 
 func (p *l3Peer) deliverUplink(pkt []byte) {
 	if p.hub.current() != p {
@@ -192,7 +227,10 @@ func (p *l3Peer) deliverUplink(pkt []byte) {
 	p.hub.pushBlock(pkt)
 }
 
-const pipeQueue = 1024
+// pipeQueue is the backlog of one lane. A full lane drops the packet instead
+// of stalling the reader that feeds every lane, and the inner TCP recovers.
+// 128 full-size packets are about 200 KB, a bounded delay on a slow link.
+const pipeQueue = 128
 
 // downLink writes each inner flow to the client-opened stream selected by
 // its VXLAN source port. QUIC retransmits a lost packet on that stream.
@@ -205,6 +243,7 @@ type downLink struct {
 	sent  atomic.Uint64
 	acks  atomic.Uint64
 	errs  atomic.Uint64
+	drops atomic.Uint64
 }
 
 func newDownLink() *downLink {
@@ -231,7 +270,7 @@ func (d *downLink) debugLoop() {
 		case <-d.done:
 			return
 		case <-tick.C:
-			fmt.Fprintf(os.Stderr, "l3dbg server sent=%d acks=%d errs=%d\n", d.sent.Load(), d.acks.Load(), d.errs.Load())
+			fmt.Fprintf(os.Stderr, "l3dbg server sent=%d acks=%d errs=%d drops=%d\n", d.sent.Load(), d.acks.Load(), d.errs.Load(), d.drops.Load())
 		}
 	}
 }
@@ -245,6 +284,8 @@ func (d *downLink) send(pkt []byte) {
 	select {
 	case <-d.done:
 	case d.lanes[lane] <- cp:
+	default:
+		d.drops.Add(1)
 	}
 }
 
@@ -293,10 +334,14 @@ func (d *downLink) writeLane(idx int, gen uint64, stream *quic.Stream) {
 	}
 }
 
+// returnPkt hands a packet back to the lane for the replacing writer.
+// A lane that filled up meanwhile drops it, like a new packet would be.
 func (d *downLink) returnPkt(q chan []byte, pkt []byte) {
 	select {
 	case <-d.done:
 	case q <- pkt:
+	default:
+		d.drops.Add(1)
 	}
 }
 

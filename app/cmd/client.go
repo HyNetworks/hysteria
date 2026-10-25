@@ -238,6 +238,7 @@ type l3TunConfig struct {
 	Mode    string        `mapstructure:"mode"`
 	Lanes   int           `mapstructure:"lanes"`
 	Type    string        `mapstructure:"type"`
+	Filter  string        `mapstructure:"filter"` // tun only: vxlan (default) or none
 	Relay   l3RelayConfig `mapstructure:"relay"`
 }
 
@@ -1066,14 +1067,7 @@ func runClient(v *viper.Viper) {
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signalChan)
 
-	hupChan := make(chan os.Signal, 1)
-	signal.Notify(hupChan, syscall.SIGHUP)
-	defer signal.Stop(hupChan)
-	go func() {
-		for range hupChan {
-			reloadL3(v, l3Dev, decodeL3Tun(v))
-		}
-	}()
+	defer watchL3Reload(v, l3Dev)()
 
 	runnerChan := make(chan clientModeRunnerResult, 1)
 	go func() {
@@ -1351,6 +1345,14 @@ func newL3TUN(config l3TunConfig) (*tun.Raw, error) {
 	if err != nil {
 		return nil, configError{Field: "l3tun", Err: err}
 	}
+	switch strings.ToLower(strings.TrimSpace(config.Filter)) {
+	case "", "vxlan":
+		dev.VXLANOnly = true
+	case "none":
+		dev.VXLANOnly = false
+	default:
+		return nil, configError{Field: "l3tun.filter", Err: fmt.Errorf("unsupported filter %q", config.Filter)}
+	}
 	dev.Logger = logger
 	return dev, nil
 }
@@ -1421,6 +1423,22 @@ func parseRelayVNIs(cfg l3RelayConfig) ([]vxrelay.VNI, error) {
 		vnis = append(vnis, vxrelay.VNI{ID: item.VNI, VTEP: vtep, Allow: allow})
 	}
 	return vnis, nil
+}
+
+// watchL3Reload reloads the relay VNI table on SIGHUP and returns the stop
+// function. Only a relay has a table, so any other setup leaves SIGHUP alone.
+func watchL3Reload(v *viper.Viper, dev l3Device) func() {
+	if _, ok := dev.(l3Reloader); !ok {
+		return func() {}
+	}
+	hupChan := make(chan os.Signal, 1)
+	signal.Notify(hupChan, syscall.SIGHUP)
+	go func() {
+		for range hupChan {
+			reloadL3(v, dev, decodeL3Tun(v))
+		}
+	}()
+	return func() { signal.Stop(hupChan) }
 }
 
 // reloadL3 re-reads the config file and replaces only the relay VNI table.

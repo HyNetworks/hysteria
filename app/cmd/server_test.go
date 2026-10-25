@@ -227,22 +227,26 @@ func TestServerConfig(t *testing.T) {
 			ListenHTTPS: ":443",
 			ForceHTTPS:  true,
 		},
-		L3TUN: &l3TunConfig{
-			Name:    "hytun0",
-			MTU:     1600,
-			Address: "10.200.0.1/30",
-			Peer:    "10.200.0.2",
-			Mode:    "stream",
-			Lanes:   8,
-			Type:    "tun",
-			Relay: l3RelayConfig{
-				Listen: "127.0.0.1:4789",
-				VNIs: []l3RelayVNI{{
-					VNI:   500,
-					VTEP:  "192.168.7.1:4789",
-					Allow: []string{"192.168.7.0/24"},
-				}},
+		L3TUN: &serverL3TunConfig{
+			l3TunConfig: l3TunConfig{
+				Name:    "hytun0",
+				MTU:     1600,
+				Address: "10.200.0.1/30",
+				Peer:    "10.200.0.2",
+				Mode:    "stream",
+				Lanes:   8,
+				Type:    "tun",
+				Filter:  "vxlan",
+				Relay: l3RelayConfig{
+					Listen: "127.0.0.1:4789",
+					VNIs: []l3RelayVNI{{
+						VNI:   500,
+						VTEP:  "192.168.7.1:4789",
+						Allow: []string{"192.168.7.0/24"},
+					}},
+				},
 			},
+			Users: []string{"alice"},
 		},
 	})
 }

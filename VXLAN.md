@@ -7,11 +7,11 @@ VXLAN 网卡有两种放法，配置里用 `l3tun.type` 切换。省略 `type` �
 | 本机网卡 | `tun` | 和 Hysteria 同一台，建在 `hytun0` 上 | 创建 MTU 1600 的 TUN，需要 root |
 | 远程网卡 | `relay` | 另一台机器。中继只在局域网上收发 UDP | 不建 TUN，不需要 root |
 
-两种模式走同一条 L3 通道，`address` / `peer` / `mode` 的含义相同。一条链路一次只服务一个请求了 L3 的客户端。IP 包最大 1600 字节。代理用的 `tun` 不参与这条链路。
+两种模式走同一条 L3 通道，`address` / `peer` / `mode` 的含义相同。一条链路一次只服务一个请求了 L3 的客户端。连接还活着时，别的用户拿不走这条链路；同一个用户重新连上来，会顶掉自己的旧连接，旧连接被服务端关闭，然后自己重连。IP 包最大 1600 字节。代理用的 `tun` 不参与这条链路。
 
 两端都要写 `l3tun`。客户端写了，认证请求里才带 `Hysteria-L3`。服务端写了，才会同意。缺任意一侧，这条通道不会通。旧版 Hysteria 不认识这种包，会直接丢掉。
 
-`mode` 省略是 `datagram`：一颗 IP 包放进一条 QUIC datagram，路径装不下就切成均匀的几片，缺一片整包作废。`mode: stream` 把每个内层流放进自己的可靠 QUIC stream。外层 UDP 源端口决定落在 32 条里的哪一条，同一条流不拆开，其它流不被它挡住。丢了的包由 QUIC 重传。配置里的 `lanes` 会放进认证头，流池大小固定是 32，不跟着这个数字变。
+`mode` 省略是 `datagram`：一颗 IP 包放进一条 QUIC datagram，路径装不下就切成均匀的几片，缺一片整包作废。`mode: stream` 把每个内层流放进自己的可靠 QUIC stream。外层 UDP 源端口决定落在 32 条里的哪一条，同一条流不拆开，其它流不被它挡住。丢了的包由 QUIC 重传。每条 lane 最多排 128 颗包，排满后新包直接丢弃，由内层 TCP 自己重传。这样一条被压住的流不会卡住其它 lane，排队延迟也有上限。配置里的 `lanes` 会放进认证头，流池大小固定是 32，不跟着这个数字变。
 
 ```yaml
 l3tun:
@@ -76,6 +76,17 @@ ip addr replace 10.201.0.1/24 dev vx0
 ```
 
 程序自己创建 `hytun0` 并配置 `address`。不要再手动加同一个地址。`name` 不能和已有网卡重名。`mtu` 省略时是 1600，不能大于 1600。`peer` 必须和 `address` 同一 IP 版本。
+
+`filter` 省略时是 `vxlan`：从隧道收到的包，只有发往本端 `address`、UDP 目的端口 4789 的才会写进 `hytun0`（IPv4 的后续分片按地址和协议放行）。其它包一律丢掉，所以即使开了 `ip_forward`，对端也到不了这台机器能路由到的其它地方，比如云厂商的 metadata 地址或 VPC 内网。只有在 `hytun0` 上跑的不是 VXLAN 时，才写 `filter: none`。
+
+### 谁能使用这条链路
+
+服务端的 `l3tun.users` 列出可以使用 L3 的认证 ID，也就是 `userpass` 的用户名，或者 `http` 认证返回的 `id`。不在列表里的用户照常使用代理，但拿不到 L3。列表为空时，所有通过认证的用户都能用，启动时会打一条警告。`password` 认证下所有客户端的 ID 都是 `user`，这个列表不起作用，能用 L3 的就是知道密码的人。
+
+```yaml
+l3tun:
+  users: [homelab]
+```
 
 同一对 `hytun0` 上可以再建 VNI 不同的网卡，内核按 VNI 分开，Hysteria 配置不用改：
 
@@ -194,6 +205,8 @@ l3tun:
 ### 热重载 VNI
 
 `l3tun.relay.vnis` 可以在进程运行时换掉。QUIC 连接、L3 通道和 `relay.listen` 上的 UDP socket 都不动。表换掉之后，下一个包按新表转发；正在处理的那一颗包仍用旧表。
+
+只有 `type: relay` 时进程才会接管 SIGHUP。其它配置下 SIGHUP 保持默认行为，进程会退出。
 
 两端的 `hysteria-thv.service` 加上这一行，然后执行 `systemctl daemon-reload`：
 
@@ -358,8 +371,10 @@ l3tun:
 | `relay.vnis[].vni` | 无。VNI 由内核 VXLAN 区分 | 1 到 16777215，不能重复 |
 | `relay.vnis[].vtep` | 无 | 这个 VNI 的回程 `主机:端口`，端口可省略 |
 | `relay.vnis[].allow` | 无 | 除 `vtep` 之外还接受的源前缀 |
+| `filter` | `vxlan`（默认）或 `none` | 不使用，中继总是只收 VXLAN |
+| `users` | 仅服务端：可以使用 L3 的认证 ID，空表示全部 | 相同 |
 
-写入本机 TUN 之前，会核对 IP 源地址等于 `peer`。中继下行同样核对：外层源是 `peer`，目的是本端 `address`，UDP 目的端口 4789，并且 VNI 在表里。服务端只保留最近一个请求了 L3 的连接。没有对端时，从本机读到的包直接丢弃。流量计入现有的 `TrafficLogger`，方向和 UDP 代理一致。
+写入本机 TUN 之前，会核对 IP 源地址等于 `peer`，默认还要求包是发往本端 `address`、端口 4789 的 UDP。中继下行同样核对：外层源是 `peer`，目的是本端 `address`，UDP 目的端口 4789，并且 VNI 在表里。服务端只绑定一个 L3 连接，规则见开头。没有对端时，从本机读到的包直接丢弃。流量计入现有的 `TrafficLogger`，方向和 UDP 代理一致。
 
 ## 验证
 

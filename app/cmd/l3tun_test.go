@@ -145,3 +145,23 @@ func TestParseVTEP(t *testing.T) {
 		t.Fatalf("full = %v %v", full, err)
 	}
 }
+
+func TestL3TUNFilter(t *testing.T) {
+	base := l3TunConfig{Name: "hytun0", Address: "10.200.0.1/30", Peer: "10.200.0.2"}
+	for filter, want := range map[string]bool{"": true, "vxlan": true, "None": false} {
+		cfg := base
+		cfg.Filter = filter
+		dev, err := newL3Device(cfg)
+		if err != nil {
+			t.Fatalf("filter %q: %v", filter, err)
+		}
+		if got := dev.(tunL3).VXLANOnly; got != want {
+			t.Errorf("filter %q: VXLANOnly = %v, want %v", filter, got, want)
+		}
+	}
+	cfg := base
+	cfg.Filter = "bogus"
+	if _, err := newL3Device(cfg); err == nil {
+		t.Fatal("unknown filter was accepted")
+	}
+}

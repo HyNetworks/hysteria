@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,10 @@ import (
 	"go.uber.org/zap"
 )
 
-const defaultL3MTU = 1600
+const (
+	defaultL3MTU = 1600
+	vxlanPort    = 4789
+)
 
 // L3Conn is the QUIC side of a raw IP tunnel.
 type L3Conn interface {
@@ -31,6 +35,9 @@ type Raw struct {
 	Address netip.Prefix
 	Peer    netip.Addr
 	Logger  *zap.Logger
+	// VXLANOnly writes only UDP to Address port 4789 into the TUN. Without it,
+	// the peer can reach anything this host routes to once it forwards packets.
+	VXLANOnly bool
 
 	mu      sync.Mutex
 	closed  bool
@@ -62,12 +69,13 @@ func NewRaw(name string, mtu uint32, address netip.Prefix, peer netip.Addr) (*Ra
 	if mtu > defaultL3MTU {
 		return nil, fmt.Errorf("mtu %d is above %d", mtu, defaultL3MTU)
 	}
-	return &Raw{Name: name, MTU: mtu, Address: address, Peer: peer}, nil
+	return &Raw{Name: name, MTU: mtu, Address: address, Peer: peer, VXLANOnly: true}, nil
 }
 
 // Serve creates the TUN and copies packets until Close.
 // Packets read from the tunnel are sent as-is. Packets received from conn
-// are written only when their source address is the peer.
+// are written only when their source address is the peer and, with VXLANOnly,
+// they are VXLAN addressed to this end.
 func (r *Raw) Serve(conn L3Conn) error {
 	r.mu.Lock()
 	if r.closed {
@@ -213,8 +221,7 @@ func (r *Raw) writeLoop(dev stun.Tun, conn L3Conn) error {
 			}
 			return err
 		}
-		src, ok := packetSource(pkt)
-		if !ok || src != r.Peer || len(pkt) > int(r.MTU) {
+		if len(pkt) > int(r.MTU) || !r.accepts(pkt) {
 			continue
 		}
 		if err := writeIP(dev, pkt); err != nil {
@@ -234,6 +241,45 @@ func (r *Raw) isClosed() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.closed
+}
+
+func (r *Raw) accepts(pkt []byte) bool {
+	src, ok := packetSource(pkt)
+	if !ok || src != r.Peer {
+		return false
+	}
+	return !r.VXLANOnly || isVXLANTo(pkt, r.Address.Addr())
+}
+
+// isVXLANTo reports whether pkt is UDP to dst port 4789. A later IPv4 fragment
+// has no UDP header; it passes on the address and protocol, and the kernel
+// drops it unless the first fragment, which carries the port, arrived too.
+// IPv6 extension headers are not followed, so an IPv6 fragment is refused.
+func isVXLANTo(pkt []byte, dst netip.Addr) bool {
+	switch pkt[0] >> 4 {
+	case 4:
+		ihl := int(pkt[0]&0x0f) * 4
+		if len(pkt) < 20 || ihl < 20 || len(pkt) < ihl || pkt[9] != 17 {
+			return false
+		}
+		if netip.AddrFrom4(([4]byte)(pkt[16:20])) != dst {
+			return false
+		}
+		if binary.BigEndian.Uint16(pkt[6:8])&0x1fff != 0 {
+			return true
+		}
+		return len(pkt) >= ihl+8 && binary.BigEndian.Uint16(pkt[ihl+2:ihl+4]) == vxlanPort
+	case 6:
+		if len(pkt) < 40+8 || pkt[6] != 17 {
+			return false
+		}
+		if netip.AddrFrom16(([16]byte)(pkt[24:40])) != dst {
+			return false
+		}
+		return binary.BigEndian.Uint16(pkt[42:44]) == vxlanPort
+	default:
+		return false
+	}
 }
 
 func writeIP(dev stun.Tun, ip []byte) error {

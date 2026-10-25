@@ -16,7 +16,10 @@ import (
 	"github.com/apernet/hysteria/core/v2/internal/protocol"
 )
 
-const pipeQueue = 1024
+// pipeQueue is the backlog of one lane. A full lane drops the packet instead
+// of stalling the TUN reader that feeds every lane, and the inner TCP recovers.
+// 128 full-size packets are about 200 KB, a bounded delay on a slow link.
+const pipeQueue = 128
 
 // l3StreamEndpoint carries each inner flow on its own reliable QUIC stream.
 // The lane is the VXLAN source port, which Linux derives from the inner flow.
@@ -36,6 +39,7 @@ type l3StreamEndpoint struct {
 	ackIn    atomic.Uint64
 	upErr    atomic.Uint64
 	downErr  atomic.Uint64
+	drops    atomic.Uint64
 }
 
 func openL3Streams(conn *quic.Conn, _ int) (*l3StreamEndpoint, error) {
@@ -73,6 +77,9 @@ func (e *l3StreamEndpoint) Send(ipPkt []byte) error {
 		return coreErrs.ClosedError{}
 	case e.up[lane] <- pkt:
 		return nil
+	default:
+		e.drops.Add(1)
+		return nil
 	}
 }
 
@@ -93,8 +100,8 @@ func (e *l3StreamEndpoint) debugLoop() {
 		case <-e.done:
 			return
 		case <-tick.C:
-			fmt.Fprintf(os.Stderr, "l3dbg client up=%d down=%d ack=%d upErr=%d downErr=%d\n",
-				e.upSent.Load(), e.downSent.Load(), e.ackIn.Load(), e.upErr.Load(), e.downErr.Load())
+			fmt.Fprintf(os.Stderr, "l3dbg client up=%d down=%d ack=%d upErr=%d downErr=%d drops=%d\n",
+				e.upSent.Load(), e.downSent.Load(), e.ackIn.Load(), e.upErr.Load(), e.downErr.Load(), e.drops.Load())
 		}
 	}
 }

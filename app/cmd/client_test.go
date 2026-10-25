@@ -160,6 +160,7 @@ func TestClientConfig(t *testing.T) {
 			Mode:    "stream",
 			Lanes:   8,
 			Type:    "tun",
+			Filter:  "vxlan",
 			Relay: l3RelayConfig{
 				Listen: "127.0.0.1:4789",
 				VNIs: []l3RelayVNI{{

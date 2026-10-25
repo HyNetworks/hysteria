@@ -93,7 +93,13 @@ type serverConfig struct {
 	Outbounds             []serverConfigOutboundEntry `mapstructure:"outbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
-	L3TUN                 *l3TunConfig                `mapstructure:"l3tun"`
+	L3TUN                 *serverL3TunConfig          `mapstructure:"l3tun"`
+}
+
+// serverL3TunConfig adds the server-only fields to the shared l3tun section.
+type serverL3TunConfig struct {
+	l3TunConfig `mapstructure:",squash"`
+	Users       []string `mapstructure:"users"` // auth IDs that may bind L3, empty allows all
 }
 
 type serverConfigRealm struct {
@@ -1456,6 +1462,7 @@ func (c *serverConfig) fillL3(hyConfig *server.Config) error {
 	if c.L3TUN != nil {
 		hyConfig.L3Mode = c.L3TUN.Mode
 		hyConfig.L3Lanes = c.L3TUN.Lanes
+		hyConfig.L3AuthIDs = c.L3TUN.Users
 	}
 	return nil
 }
@@ -1740,7 +1747,7 @@ func runServer(v *viper.Viper) {
 	}
 	var l3Dev l3Device
 	if config.L3TUN != nil {
-		l3Dev, err = newL3Device(*config.L3TUN)
+		l3Dev, err = newL3Device(config.L3TUN.l3TunConfig)
 		if err != nil {
 			logger.Fatal("failed to load server config", zap.Error(err))
 		}
@@ -1748,9 +1755,12 @@ func runServer(v *viper.Viper) {
 		if err != nil {
 			logger.Fatal("failed to enable L3 tunnel", zap.Error(err))
 		}
+		if len(config.L3TUN.Users) == 0 && !strings.EqualFold(config.Auth.Type, "password") {
+			logger.Warn("l3tun.users is empty, any authenticated user can bind the L3 tunnel")
+		}
 		defer l3Dev.Close()
 		go func() {
-			mode, field := l3ListenLog(*config.L3TUN)
+			mode, field := l3ListenLog(config.L3TUN.l3TunConfig)
 			logger.Info(mode+" listening", field)
 			if err := l3Dev.Serve(l3Conn); err != nil {
 				logger.Error(mode+" stopped", zap.Error(err))
@@ -1771,14 +1781,7 @@ func runServer(v *viper.Viper) {
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signalChan)
 
-	hupChan := make(chan os.Signal, 1)
-	signal.Notify(hupChan, syscall.SIGHUP)
-	defer signal.Stop(hupChan)
-	go func() {
-		for range hupChan {
-			reloadL3(v, l3Dev, decodeL3Tun(v))
-		}
-	}()
+	defer watchL3Reload(v, l3Dev)()
 
 	serveErrChan := make(chan error, 1)
 	go func() {

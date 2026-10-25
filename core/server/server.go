@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -23,6 +24,7 @@ import (
 const (
 	closeErrCodeOK                  = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
+	closeErrCodeL3Replaced          = 0x10b // HTTP3 ErrCodeRequestRejected
 )
 
 type Server interface {
@@ -168,9 +170,8 @@ type h3sHandler struct {
 
 	udpSM *udpSessionManager // Only set after authentication
 
-	l3       *l3Hub
-	l3Peer   *l3Peer
-	l3Active bool
+	l3     *l3Hub
+	l3Peer atomic.Pointer[l3Peer] // read by stream handlers, set once at auth
 }
 
 func newH3sHandler(config *Config, conn *quic.Conn, l3 *l3Hub) *h3sHandler {
@@ -192,7 +193,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
 				RxAuto:     h.config.IgnoreClientBandwidth,
-				L3:         h.l3Active,
+				L3:         h.l3Peer.Load() != nil,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			return
@@ -223,7 +224,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// Auth OK, send response
-			grantL3 := authReq.L3 && h.l3 != nil
+			grantL3 := authReq.L3 && h.l3 != nil && h.config.l3Allowed(id)
 			l3Mode := ""
 			l3Lanes := 0
 			if grantL3 {
@@ -235,18 +236,14 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			var peer *l3Peer
 			if grantL3 {
-				peer = h.l3.adopt(h.conn, id, h.config.TrafficLogger)
+				peer = h.l3.adopt(h.conn, id, h.config.TrafficLogger, l3Mode == protocol.L3ModeStream)
 				grantL3 = peer != nil
-			}
-			if grantL3 && l3Mode == protocol.L3ModeStream {
-				peer.down = newDownLink()
 			}
 			if !grantL3 {
 				l3Mode = ""
 				l3Lanes = 0
 			}
-			h.l3Peer = peer
-			h.l3Active = grantL3
+			h.l3Peer.Store(peer)
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
@@ -342,21 +339,22 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
 			return false, err
 		}
-		if h.l3Peer == nil {
+		peer := h.l3Peer.Load()
+		if peer == nil {
 			stream.CancelRead(0)
 			stream.CancelWrite(0)
 			return true, nil
 		}
 		if hdr[0] == protocol.L3StreamDownlink {
-			if h.l3Peer.down == nil {
+			if peer.down == nil {
 				stream.CancelRead(0)
 				stream.CancelWrite(0)
 				return true, nil
 			}
-			h.l3Peer.down.add(int(hdr[1]), stream)
+			peer.down.add(int(hdr[1]), stream)
 			return true, nil
 		}
-		go h.readL3Uplink(stream)
+		go readL3Uplink(stream, peer)
 		return true, nil
 	case protocol.FrameTypeTCPRequest:
 		// StreamDispatcher only peeks the frame type. Consume it so ReadTCPRequest
@@ -373,16 +371,14 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 	}
 }
 
-func (h *h3sHandler) readL3Uplink(stream *quic.Stream) {
+func readL3Uplink(stream *quic.Stream, peer *l3Peer) {
 	for {
 		pkt, err := protocol.ReadL3Frame(stream)
 		if err != nil {
 			stream.CancelRead(0)
 			return
 		}
-		if h.l3Peer != nil {
-			h.l3Peer.deliverUplink(pkt)
-		}
+		peer.deliverUplink(pkt)
 	}
 }
 

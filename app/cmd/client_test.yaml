@@ -128,6 +128,7 @@ l3tun:
   mode: stream
   lanes: 8
   type: tun
+  filter: vxlan
   relay:
     listen: 127.0.0.1:4789
     vnis:

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +41,7 @@ type Config struct {
 	EnableL3              bool
 	L3Mode                string
 	L3Lanes               int
+	L3AuthIDs             []string // empty allows every authenticated user
 	UDPIdleTimeout        time.Duration
 	Authenticator         Authenticator
 	EventLogger           EventLogger
@@ -335,4 +337,9 @@ func (s *StreamStats) setHookedReqAddr(addr string) {
 	if addr != s.ReqAddr.Load() {
 		s.HookedReqAddr.Store(addr)
 	}
+}
+
+// l3Allowed reports whether the user with this auth ID may bind the L3 tunnel.
+func (c *Config) l3Allowed(id string) bool {
+	return len(c.L3AuthIDs) == 0 || slices.Contains(c.L3AuthIDs, id)
 }
