@@ -34,3 +34,23 @@ func setOptional(fd, proto, opt, value int) error {
 	}
 	return err
 }
+
+// growBuffers raises the socket buffers so a burst from a VTEP, which a fast
+// LAN or cloud network delivers at line rate, is queued instead of dropped
+// while the relay is busy. SO_*BUFFORCE ignores net.core.rmem_max and needs
+// CAP_NET_ADMIN; without it the plain option is capped by the sysctl.
+func growBuffers(conn *net.UDPConn, size int) {
+	raw, err := conn.SyscallConn()
+	if err == nil {
+		var rerr, werr error
+		_ = raw.Control(func(fd uintptr) {
+			rerr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, size)
+			werr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, size)
+		})
+		if rerr == nil && werr == nil {
+			return
+		}
+	}
+	_ = conn.SetReadBuffer(size)
+	_ = conn.SetWriteBuffer(size)
+}

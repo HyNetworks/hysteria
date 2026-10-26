@@ -18,6 +18,10 @@ type L3Conn interface {
 	Receive() ([]byte, error)
 }
 
+// socketBuffer is the LAN socket's receive and send buffer. The kernel default
+// of about 208 KB overflows within a millisecond of a VTEP burst on a fast link.
+const socketBuffer = 4 << 20
+
 // VNI is one overlay network and the LAN endpoint it is pinned to.
 type VNI struct {
 	ID    uint32
@@ -79,6 +83,7 @@ func New(cfg Config) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
+	growBuffers(conn, socketBuffer)
 	if err := allowFragmentation(conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("allow fragmentation: %w", err)
