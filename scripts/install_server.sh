@@ -758,7 +758,8 @@ tpl_hysteria_server_service_base() {
   cat << EOF
 [Unit]
 Description=Hysteria Server Service (${_config_name}.yaml)
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
