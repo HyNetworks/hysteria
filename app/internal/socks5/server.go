@@ -2,21 +2,39 @@ package socks5
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"time"
 
 	"github.com/txthinking/socks5"
 
 	"github.com/apernet/hysteria/core/v2/client"
 )
 
-const udpBufferSize = 4096
+const (
+	udpBufferSize = 4096
+
+	// defaultUDPTimeout is the idle timeout of a UDP association, matching the
+	// value already used by the tproxy and forwarding entry points.
+	defaultUDPTimeout = 60 * time.Second
+
+	// handshakeTimeout bounds how long a client may take to complete the SOCKS5
+	// handshake. Without it a client that connects and then stays silent pins a
+	// goroutine and a file descriptor for the lifetime of the process.
+	handshakeTimeout = 10 * time.Second
+)
 
 // Server is a SOCKS5 server using a Hysteria client as outbound.
 type Server struct {
-	HyClient    client.Client
-	AuthFunc    func(username, password string) bool // nil = no authentication
-	DisableUDP  bool
+	HyClient   client.Client
+	AuthFunc   func(username, password string) bool // nil = no authentication
+	DisableUDP bool
+	// UDPTimeout is the idle timeout of a UDP association. Zero means
+	// defaultUDPTimeout. A UDP association owns an ephemeral port for as long as
+	// it lives, so without a timeout a client that never closes its control
+	// connection pins that port indefinitely.
+	UDPTimeout  time.Duration
 	EventLogger EventLogger
 }
 
@@ -38,6 +56,9 @@ func (s *Server) Serve(listener net.Listener) error {
 }
 
 func (s *Server) dispatch(conn net.Conn) {
+	// Bound the handshake. Cleared below so it never applies to the proxied
+	// traffic itself, which is legitimately long-lived and idle.
+	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	ok, _ := s.negotiate(conn)
 	if !ok {
 		_ = conn.Close()
@@ -49,6 +70,7 @@ func (s *Server) dispatch(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	switch req.Cmd {
 	case socks5.CmdConnect: // TCP
 		s.handleTCP(conn, req)
@@ -218,6 +240,29 @@ func (s *Server) handleUDP(conn net.Conn, req *socks5.Request) {
 		errChan <- err
 	}()
 	closeErr = <-errChan
+	if isUDPTimeout(closeErr) {
+		// Going idle is how a UDP association normally ends: there is no FIN in
+		// UDP, so silence is the only signal we get. Reporting it as an error
+		// would fill the log with routine events.
+		closeErr = nil
+	}
+}
+
+// updateUDPDeadline slides the association's idle deadline forward. Mirrors
+// UDPTProxy.updateConnDeadline in app/internal/tproxy/udp_linux.go.
+func (s *Server) updateUDPDeadline(conn *net.UDPConn) error {
+	timeout := s.UDPTimeout
+	if timeout == 0 {
+		timeout = defaultUDPTimeout
+	}
+	return conn.SetReadDeadline(time.Now().Add(timeout))
+}
+
+// isUDPTimeout reports whether err is this association going idle, which is an
+// ordinary end of life rather than a failure.
+func isUDPTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn) error {
@@ -225,6 +270,10 @@ func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn) error {
 	buf := make([]byte, udpBufferSize)
 	// local -> remote
 	for {
+		// Refresh the idle deadline before every read. An association that stops
+		// carrying traffic must release its ephemeral port instead of waiting for
+		// the control connection, which the client may never close.
+		_ = s.updateUDPDeadline(udpConn)
 		n, cAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			return err
@@ -250,6 +299,8 @@ func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn) error {
 						_ = udpConn.Close()
 						return
 					}
+					// Traffic in this direction keeps the association alive too.
+					_ = s.updateUDPDeadline(udpConn)
 					atyp, addr, port, err := socks5.ParseAddress(from)
 					if err != nil {
 						continue
