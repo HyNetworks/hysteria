@@ -31,6 +31,10 @@ func (c *mockHyClient) UDP() (client.HyUDPConn, error) {
 	return nil, errors.New("not implemented")
 }
 
+func (c *mockHyClient) L3() (client.HyL3Conn, error) {
+	return nil, errors.New("L3 not enabled")
+}
+
 func (c *mockHyClient) Close() error {
 	return nil
 }

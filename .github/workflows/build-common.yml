@@ -3,6 +3,10 @@ name: "Build common"
 on:
   workflow_call:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   build:
     name: Build

@@ -26,7 +26,15 @@ const (
 type Client interface {
 	TCP(addr string) (net.Conn, error)
 	UDP() (HyUDPConn, error)
+	L3() (HyL3Conn, error)
 	Close() error
+}
+
+// HyL3Conn carries whole IP packets across the QUIC connection.
+// Send does not keep ipPkt after it returns, so the caller may reuse it.
+type HyL3Conn interface {
+	Send(ipPkt []byte) error
+	Receive() ([]byte, error)
 }
 
 type HyUDPConn interface {
@@ -37,6 +45,8 @@ type HyUDPConn interface {
 
 type HandshakeInfo struct {
 	UDPEnabled  bool
+	L3          bool
+	L3Mode      string
 	Tx          uint64 // 0 if using BBR
 	ServerAddr  net.Addr
 	ECHAccepted bool
@@ -64,6 +74,13 @@ type clientImpl struct {
 	conn    *quic.Conn
 
 	udpSM *udpSessionManager
+	l3    l3Session
+}
+
+// l3Session is the datagram or stream endpoint behind L3().
+type l3Session interface {
+	HyL3Conn
+	close()
 }
 
 func (c *clientImpl) connect() (*HandshakeInfo, error) {
@@ -125,10 +142,16 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		},
 		Header: make(http.Header),
 	}
-	protocol.AuthRequestToHeader(req.Header, protocol.AuthRequest{
+	authReq := protocol.AuthRequest{
 		Auth: c.config.Auth,
 		Rx:   c.config.BandwidthConfig.MaxRx,
-	})
+		L3:   c.config.RequestL3,
+	}
+	if c.config.RequestL3 && protocol.L3UsesStreams(c.config.L3Mode) {
+		authReq.L3Mode = protocol.L3ModeStream
+		authReq.L3Lanes = protocol.NormalizeL3Lanes(c.config.L3Lanes)
+	}
+	protocol.AuthRequestToHeader(req.Header, authReq)
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		if conn != nil {
@@ -170,15 +193,82 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	c.pktConn = pktConn
 	c.tr = tr
 	c.conn = conn
-	if authResp.UDPEnabled {
-		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
+	if authResp.UDPEnabled || authResp.L3 {
+		// One ReceiveDatagram loop. UDP sessions are fed from it; L3 uses the same read.
+		if authResp.UDPEnabled {
+			c.udpSM = newFedUDPSessionManager(&udpIOImpl{Conn: conn})
+		}
+		if authResp.L3 {
+			if protocol.L3UsesStreams(c.config.L3Mode) && authResp.L3Mode == protocol.L3ModeStream {
+				ep, err := openL3Streams(conn, c.config.L3Mode == protocol.L3ModeHybrid)
+				if err != nil {
+					_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+					_ = tr.Close()
+					_ = pktConn.Close()
+					return nil, err
+				}
+				c.l3 = ep
+			} else {
+				c.l3 = newL3Endpoint(conn)
+			}
+		}
+		go c.datagramLoop()
+	}
+	mode := ""
+	if c.l3 != nil {
+		if ep, stream := c.l3.(*l3StreamEndpoint); stream {
+			mode = protocol.L3ModeStream
+			if ep.hybrid {
+				mode = protocol.L3ModeHybrid
+			}
+		} else {
+			mode = protocol.L3ModeDatagram
+		}
 	}
 	return &HandshakeInfo{
 		UDPEnabled:  authResp.UDPEnabled,
+		L3:          authResp.L3,
+		L3Mode:      mode,
 		Tx:          actualTx,
 		ServerAddr:  c.config.ServerAddr,
 		ECHAccepted: conn.ConnectionState().TLS.ECHAccepted,
 	}, nil
+}
+
+func (c *clientImpl) datagramLoop() {
+	defer func() {
+		if c.udpSM != nil {
+			c.udpSM.Stop()
+		}
+		if c.l3 != nil {
+			c.l3.close()
+		}
+	}()
+	for {
+		raw, err := c.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+		if frag, ok := protocol.ParseL3Fragment(raw); ok {
+			switch ep := c.l3.(type) {
+			case *l3Endpoint:
+				if pkt := ep.asm.Feed(frag.PacketID, frag.FragID, frag.FragCount, frag.Data); pkt != nil {
+					ep.push(pkt)
+				}
+			case *l3StreamEndpoint:
+				ep.feedDatagram(frag)
+			}
+			continue
+		}
+		if c.udpSM == nil {
+			continue
+		}
+		msg, err := protocol.ParseUDPMessage(raw)
+		if err != nil {
+			continue
+		}
+		c.udpSM.feed(msg)
+	}
 }
 
 // openStream wraps the stream with QStream, which handles Close() properly
@@ -235,6 +325,14 @@ func (c *clientImpl) UDP() (HyUDPConn, error) {
 		return nil, coreErrs.DialError{Message: "UDP not enabled"}
 	}
 	return c.udpSM.NewUDP()
+}
+
+func (c *clientImpl) L3() (HyL3Conn, error) {
+	if c.l3 == nil {
+		// The server has no l3tun, does not list this user, or another user holds the tunnel.
+		return nil, coreErrs.DialError{Message: "server did not grant L3"}
+	}
+	return c.l3, nil
 }
 
 func (c *clientImpl) Close() error {

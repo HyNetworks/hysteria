@@ -5,6 +5,10 @@ on:
     tags:
       - app/v*.*.*
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   build:
     uses: ./.github/workflows/build-common.yml
@@ -36,8 +40,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: build/*
+          prerelease: true
+          generate_release_notes: true
 
       - name: Upload CF bucket
+        continue-on-error: true
         uses: shallwefootball/upload-s3-action@v1.3.3
         with:
           aws_key_id: ${{ secrets.CF_KEY_ID }}
@@ -48,6 +55,7 @@ jobs:
           destination_dir: "app/${{ steps.get_version.outputs.version }}"
 
       - name: Publish to API
+        continue-on-error: true
         run: |
           export HY_API_POST_KEY=${{ secrets.HY2_API_POST_KEY }}
           uv run python hyperbole.py publish

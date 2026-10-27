@@ -1,6 +1,7 @@
 package utils_test
 
 import (
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -20,6 +21,10 @@ func (c *MockEchoHyClient) UDP() (client.HyUDPConn, error) {
 	return &mockEchoUDPConn{
 		BufChan: make(chan mockEchoUDPPacket, 10),
 	}, nil
+}
+
+func (c *MockEchoHyClient) L3() (client.HyL3Conn, error) {
+	return nil, errors.New("L3 not enabled")
 }
 
 func (c *MockEchoHyClient) Close() error {

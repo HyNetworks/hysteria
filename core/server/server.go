@@ -5,9 +5,11 @@ import (
 	crand "crypto/rand"
 	"crypto/tls"
 	"errors"
+	"io"
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -22,11 +24,13 @@ import (
 const (
 	closeErrCodeOK                  = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
+	closeErrCodeL3Replaced          = 0x10b // HTTP3 ErrCodeRequestRejected
 )
 
 type Server interface {
 	Serve() error
 	Close() error
+	L3() (HyL3Conn, error)
 }
 
 func convertToStdTLSConfig(config *Config) *tls.Config {
@@ -90,17 +94,29 @@ func NewServer(config *Config) (Server, error) {
 		}
 		return nil, err
 	}
-	return &serverImpl{
+	s := &serverImpl{
 		config:   config,
 		tr:       tr,
 		listener: listener,
-	}, nil
+	}
+	if config.EnableL3 {
+		s.l3 = newL3Hub()
+	}
+	return s, nil
 }
 
 type serverImpl struct {
 	config   *Config
 	tr       *quic.Transport
 	listener *quic.Listener
+	l3       *l3Hub
+}
+
+func (s *serverImpl) L3() (HyL3Conn, error) {
+	if s.l3 == nil {
+		return nil, errors.New("L3 not enabled")
+	}
+	return s.l3, nil
 }
 
 func (s *serverImpl) Serve() error {
@@ -114,6 +130,9 @@ func (s *serverImpl) Serve() error {
 }
 
 func (s *serverImpl) Close() error {
+	if s.l3 != nil {
+		s.l3.close()
+	}
 	err := errors.Join(s.listener.Close(), s.tr.Close(), s.config.Conn.Close())
 	if s.config.Cleanup != nil {
 		err = errors.Join(err, s.config.Cleanup.Close())
@@ -122,7 +141,7 @@ func (s *serverImpl) Close() error {
 }
 
 func (s *serverImpl) handleClient(conn *quic.Conn) {
-	handler := newH3sHandler(s.config, conn)
+	handler := newH3sHandler(s.config, conn, s.l3)
 	h3s := http3.Server{
 		Handler:          handler,
 		StreamDispatcher: handler.ProxyStreamHijacker,
@@ -150,13 +169,17 @@ type h3sHandler struct {
 	connID        uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
+
+	l3     *l3Hub
+	l3Peer atomic.Pointer[l3Peer] // read by stream handlers, set once at auth
 }
 
-func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
+func newH3sHandler(config *Config, conn *quic.Conn, l3 *l3Hub) *h3sHandler {
 	return &h3sHandler{
 		config: config,
 		conn:   conn,
 		connID: rand.Uint32(),
+		l3:     l3,
 	}
 }
 
@@ -170,6 +193,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
 				RxAuto:     h.config.IgnoreClientBandwidth,
+				L3:         h.l3Peer.Load() != nil,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			return
@@ -200,10 +224,38 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// Auth OK, send response
+			grantL3 := authReq.L3 && h.l3 != nil && h.config.l3Allowed(id)
+			l3Mode := ""
+			l3Lanes := 0
+			if grantL3 {
+				l3Mode = protocol.L3ModeDatagram
+				if protocol.L3UsesStreams(h.config.L3Mode) && authReq.L3Mode == protocol.L3ModeStream {
+					l3Mode = protocol.L3ModeStream
+					l3Lanes = protocol.NormalizeL3Lanes(authReq.L3Lanes)
+				}
+			}
+			var peer *l3Peer
+			if grantL3 {
+				// The wire says stream. Whether to split by inner protocol is this end's choice.
+				policy := l3Mode
+				if l3Mode == protocol.L3ModeStream {
+					policy = h.config.L3Mode
+				}
+				peer = h.l3.adopt(h.conn, id, h.config.TrafficLogger, policy)
+				grantL3 = peer != nil
+			}
+			if !grantL3 {
+				l3Mode = ""
+				l3Lanes = 0
+			}
+			h.l3Peer.Store(peer)
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
 				Rx:         h.config.BandwidthConfig.MaxRx,
 				RxAuto:     h.config.IgnoreClientBandwidth,
+				L3:         grantL3,
+				L3Mode:     l3Mode,
+				L3Lanes:    l3Lanes,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			// Call event logger
@@ -213,19 +265,18 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if el := h.config.EventLogger; el != nil {
 				el.Connect(h.conn.RemoteAddr(), id, actualTx)
 			}
-			// Initialize UDP session manager (if UDP is enabled)
-			// We use sync.Once to make sure that only one goroutine is started,
-			// as ServeHTTP may be called by multiple goroutines simultaneously
-			if !h.config.DisableUDP {
-				go func() {
-					sm := newUDPSessionManager(
+			// One datagram reader for this connection. UDP sessions and L3 share it.
+			if !h.config.DisableUDP || peer != nil {
+				var sm *udpSessionManager
+				if !h.config.DisableUDP {
+					sm = newUDPSessionManager(
 						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout,
 					)
 					h.udpSM = sm
-					go sm.Run()
-				}()
+				}
+				go h.serveDatagrams(sm, peer)
 			}
 		} else {
 			// Auth failed, pretend to be a normal HTTP server
@@ -237,12 +288,79 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveDatagrams is the only ReceiveDatagram loop for this QUIC connection.
+// SessionID 0 is L3. Every other datagram is a UDP session message.
+func (h *h3sHandler) serveDatagrams(sm *udpSessionManager, peer *l3Peer) {
+	if peer != nil {
+		defer h.l3.clear(peer)
+	}
+	if sm != nil {
+		stopCh := make(chan struct{})
+		go sm.idleCleanupLoop(stopCh)
+		defer close(stopCh)
+		defer sm.cleanup(false)
+	}
+	for {
+		raw, err := h.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+		if frag, ok := protocol.ParseL3Fragment(raw); ok {
+			if peer != nil {
+				peer.accept(frag)
+			}
+			continue
+		}
+		if sm == nil {
+			continue
+		}
+		msg, err := protocol.ParseUDPMessage(raw)
+		if err != nil {
+			continue
+		}
+		// Inbound UDP bytes used to be counted in ReceiveMessage. The shared
+		// reader feeds sessions directly, so the count stays here.
+		if h.config.TrafficLogger != nil {
+			if !h.config.TrafficLogger.LogTraffic(h.authID, uint64(len(msg.Data)), 0) {
+				_ = h.conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
+				return
+			}
+		}
+		sm.feed(msg)
+	}
+}
+
 func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
 	if err != nil || !h.authenticated {
 		return false, nil
 	}
 
 	switch ft {
+	case protocol.FrameTypeL3Stream:
+		if _, err := quicvarint.Read(quicvarint.NewReader(stream)); err != nil {
+			return false, err
+		}
+		var hdr [2]byte
+		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
+			return false, err
+		}
+		peer := h.l3Peer.Load()
+		if peer == nil {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			return true, nil
+		}
+		if hdr[0] == protocol.L3StreamDownlink {
+			if peer.down == nil {
+				stream.CancelRead(0)
+				stream.CancelWrite(0)
+				return true, nil
+			}
+			peer.down.add(int(hdr[1]), stream)
+			return true, nil
+		}
+		go readL3Uplink(stream, peer)
+		return true, nil
 	case protocol.FrameTypeTCPRequest:
 		// StreamDispatcher only peeks the frame type. Consume it so ReadTCPRequest
 		// starts at address length, matching pre-upgrade StreamHijacker behavior.
@@ -255,6 +373,17 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		return true, nil
 	default:
 		return false, nil
+	}
+}
+
+func readL3Uplink(stream *quic.Stream, peer *l3Peer) {
+	for {
+		pkt, err := protocol.ReadL3Frame(stream)
+		if err != nil {
+			stream.CancelRead(0)
+			return
+		}
+		peer.deliverUplink(pkt)
 	}
 }
 

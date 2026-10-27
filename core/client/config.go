@@ -9,6 +9,7 @@ import (
 	"github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/pmtud"
+	"github.com/apernet/hysteria/core/v2/internal/protocol"
 )
 
 const (
@@ -27,6 +28,9 @@ type Config struct {
 	CongestionConfig CongestionConfig
 	BandwidthConfig  BandwidthConfig
 	FastOpen         bool
+	RequestL3        bool
+	L3Mode           string
+	L3Lanes          int
 
 	filled bool // whether the fields have been verified and filled
 }
@@ -83,6 +87,15 @@ func (c *Config) verifyAndFill() error {
 		c.CongestionConfig.BBRProfile, err = congestion.NormalizeBBRProfile(c.CongestionConfig.BBRProfile)
 		if err != nil {
 			return errors.ConfigError{Field: "CongestionConfig.BBRProfile", Reason: err.Error()}
+		}
+	}
+	if c.RequestL3 {
+		c.L3Mode, err = protocol.NormalizeL3Mode(c.L3Mode)
+		if err != nil {
+			return errors.ConfigError{Field: "L3Mode", Reason: "must be datagram, stream or hybrid"}
+		}
+		if protocol.L3UsesStreams(c.L3Mode) {
+			c.L3Lanes = protocol.NormalizeL3Lanes(c.L3Lanes)
 		}
 	}
 

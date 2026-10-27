@@ -93,13 +93,24 @@ type udpSessionManager struct {
 }
 
 func newUDPSessionManager(io udpIO) *udpSessionManager {
-	m := &udpSessionManager{
+	m := newFedUDPSessionManager(io)
+	go m.run()
+	return m
+}
+
+// newFedUDPSessionManager builds a session manager whose datagrams are delivered
+// by an external dispatcher via feed. It does not read the QUIC connection.
+func newFedUDPSessionManager(io udpIO) *udpSessionManager {
+	return &udpSessionManager{
 		io:     io,
 		m:      make(map[uint32]*udpConn),
 		nextID: 1,
 	}
-	go m.run()
-	return m
+}
+
+// Stop closes every session. It is used when the shared datagram loop exits.
+func (m *udpSessionManager) Stop() {
+	m.closeCleanup()
 }
 
 func (m *udpSessionManager) run() error {

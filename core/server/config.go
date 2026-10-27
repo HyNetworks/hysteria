@@ -6,12 +6,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/errors"
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/pmtud"
+	"github.com/apernet/hysteria/core/v2/internal/protocol"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
 	"github.com/apernet/quic-go"
 )
@@ -36,6 +38,10 @@ type Config struct {
 	BandwidthConfig       BandwidthConfig
 	IgnoreClientBandwidth bool
 	DisableUDP            bool
+	EnableL3              bool
+	L3Mode                string
+	L3Lanes               int
+	L3AuthIDs             []string // empty allows every authenticated user
 	UDPIdleTimeout        time.Duration
 	Authenticator         Authenticator
 	EventLogger           EventLogger
@@ -110,6 +116,15 @@ func (c *Config) fill() error {
 	}
 	if c.Authenticator == nil {
 		return errors.ConfigError{Field: "Authenticator", Reason: "must be set"}
+	}
+	if c.EnableL3 {
+		c.L3Mode, err = protocol.NormalizeL3Mode(c.L3Mode)
+		if err != nil {
+			return errors.ConfigError{Field: "L3Mode", Reason: "must be datagram, stream or hybrid"}
+		}
+		if protocol.L3UsesStreams(c.L3Mode) {
+			c.L3Lanes = protocol.NormalizeL3Lanes(c.L3Lanes)
+		}
 	}
 	return nil
 }
@@ -322,4 +337,9 @@ func (s *StreamStats) setHookedReqAddr(addr string) {
 	if addr != s.ReqAddr.Load() {
 		s.HookedReqAddr.Store(addr)
 	}
+}
+
+// l3Allowed reports whether the user with this auth ID may bind the L3 tunnel.
+func (c *Config) l3Allowed(id string) bool {
+	return len(c.L3AuthIDs) == 0 || slices.Contains(c.L3AuthIDs, id)
 }

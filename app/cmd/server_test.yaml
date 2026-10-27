@@ -180,3 +180,20 @@ masquerade:
   listenHTTP: :80
   listenHTTPS: :443
   forceHTTPS: true
+
+l3tun:
+  name: hytun0
+  mtu: 1600
+  address: 10.200.0.1/30
+  peer: 10.200.0.2
+  mode: stream
+  lanes: 8
+  type: tun
+  filter: vxlan
+  users: [ alice ]
+  relay:
+    listen: 127.0.0.1:4789
+    vnis:
+      - vni: 500
+        vtep: 192.168.7.1:4789
+        allow: [ 192.168.7.0/24 ]
