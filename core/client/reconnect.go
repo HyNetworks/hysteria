@@ -82,6 +82,7 @@ func (rc *reconnectableClientImpl) clientDo(f func(Client) (interface{}, error))
 		rc.m.Lock()
 		if rc.client == client {
 			// This check is in case the client is already changed by another goroutine
+			_ = client.Close()
 			rc.client = nil
 		}
 		rc.m.Unlock()
