@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"math/rand"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -319,6 +320,19 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		}
 		return
 	}
+	if h.config.TCPStallTimeout > 0 {
+		// A target that stops reading but keeps its connection open would
+		// block the copy into it forever. The stream's unread data then keeps
+		// occupying the connection-level flow-control window, and once enough
+		// of it piles up every other stream of this client stalls as well
+		// (the client cannot give the stream up either: its writer is blocked
+		// on the same window). Close such a target after TCPStallTimeout
+		// without progress, and as soon as the client gives the stream up.
+		guard := newStallGuardConn(tConn, h.config.TCPStallTimeout)
+		tConn = guard
+		stop := context.AfterFunc(stream.Context(), func() { _ = guard.Close() })
+		defer stop()
+	}
 	if !hooked {
 		_ = protocol.WriteTCPResponse(stream, true, "Connected")
 	}
@@ -438,4 +452,34 @@ func (l *udpEventLoggerImpl) Close(sessionID uint32, err error) {
 	if l.EventLogger != nil {
 		l.EventLogger.UDPError(l.Conn.RemoteAddr(), l.AuthID, sessionID, err)
 	}
+}
+
+// stallGuardConn closes the wrapped connection when a single Write makes no
+// progress for timeout, and makes Close idempotent. Every Write gets a fresh
+// timeout, so a slow target that keeps accepting data is never closed.
+type stallGuardConn struct {
+	net.Conn
+	timeout   time.Duration
+	timer     *time.Timer
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newStallGuardConn(conn net.Conn, timeout time.Duration) *stallGuardConn {
+	c := &stallGuardConn{Conn: conn, timeout: timeout}
+	c.timer = time.AfterFunc(timeout, func() { _ = c.Close() })
+	c.timer.Stop()
+	return c
+}
+
+func (c *stallGuardConn) Write(p []byte) (int, error) {
+	c.timer.Reset(c.timeout)
+	n, err := c.Conn.Write(p)
+	c.timer.Stop()
+	return n, err
+}
+
+func (c *stallGuardConn) Close() error {
+	c.closeOnce.Do(func() { c.closeErr = c.Conn.Close() })
+	return c.closeErr
 }
