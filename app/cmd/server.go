@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"os"
@@ -54,12 +53,7 @@ import (
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 )
 
-const (
-	defaultListenAddr                  = ":443"
-	masqueradeProxyBufferSize          = 32 * 1024
-	masqueradeProxyMaxIdleConnections  = 100
-	masqueradeProxyMaxIdleConnsPerHost = 32
-)
+const defaultListenAddr = ":443"
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
@@ -287,35 +281,11 @@ type serverConfigMasqueradeFile struct {
 }
 
 type serverConfigMasqueradeProxy struct {
-	URL         string `mapstructure:"url"`
-	RewriteHost bool   `mapstructure:"rewriteHost"`
-	XForwarded  bool   `mapstructure:"xForwarded"`
-	Insecure    bool   `mapstructure:"insecure"`
-}
-
-type masqueradeProxyBufferPool struct {
-	pool sync.Pool
-}
-
-func newMasqueradeProxyBufferPool() *masqueradeProxyBufferPool {
-	return &masqueradeProxyBufferPool{
-		pool: sync.Pool{
-			New: func() any {
-				return make([]byte, masqueradeProxyBufferSize)
-			},
-		},
-	}
-}
-
-func (p *masqueradeProxyBufferPool) Get() []byte {
-	return p.pool.Get().([]byte)
-}
-
-func (p *masqueradeProxyBufferPool) Put(buf []byte) {
-	if cap(buf) < masqueradeProxyBufferSize {
-		return
-	}
-	p.pool.Put(buf[:masqueradeProxyBufferSize])
+	URL           string        `mapstructure:"url"`
+	RewriteHost   bool          `mapstructure:"rewriteHost"`
+	XForwarded    bool          `mapstructure:"xForwarded"`
+	Insecure      bool          `mapstructure:"insecure"`
+	FlushInterval time.Duration `mapstructure:"flushInterval"`
 }
 
 type serverConfigMasqueradeString struct {
@@ -325,13 +295,14 @@ type serverConfigMasqueradeString struct {
 }
 
 type serverConfigMasquerade struct {
-	Type        string                       `mapstructure:"type"`
-	File        serverConfigMasqueradeFile   `mapstructure:"file"`
-	Proxy       serverConfigMasqueradeProxy  `mapstructure:"proxy"`
-	String      serverConfigMasqueradeString `mapstructure:"string"`
-	ListenHTTP  string                       `mapstructure:"listenHTTP"`
-	ListenHTTPS string                       `mapstructure:"listenHTTPS"`
-	ForceHTTPS  bool                         `mapstructure:"forceHTTPS"`
+	Type               string                       `mapstructure:"type"`
+	File               serverConfigMasqueradeFile   `mapstructure:"file"`
+	Proxy              serverConfigMasqueradeProxy  `mapstructure:"proxy"`
+	String             serverConfigMasqueradeString `mapstructure:"string"`
+	ListenHTTP         string                       `mapstructure:"listenHTTP"`
+	ListenHTTPS        string                       `mapstructure:"listenHTTPS"`
+	ForceHTTPS         bool                         `mapstructure:"forceHTTPS"`
+	AdvertisedQUICPort int                          `mapstructure:"advertisedQUICPort"`
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
@@ -1507,93 +1478,17 @@ func newMasqueradeProxyHandler(config serverConfigMasqueradeProxy) (http.Handler
 	if config.URL == "" {
 		return nil, errors.New("empty proxy url")
 	}
-	target, transport, err := newMasqueradeProxyTarget(config.URL, config.Insecure)
-	if err != nil {
-		return nil, err
-	}
-	return &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.SetURL(target)
-			// SetURL rewrites the Host header,
-			// but we don't want that if rewriteHost is false
-			if !config.RewriteHost {
-				r.Out.Host = r.In.Host
-			}
-			if config.XForwarded {
-				r.SetXForwarded()
-			}
-		},
-		Transport:  transport,
-		BufferPool: newMasqueradeProxyBufferPool(),
+	return masq.NewProxyHandler(masq.ProxyOptions{
+		URL:           config.URL,
+		RewriteHost:   config.RewriteHost,
+		XForwarded:    config.XForwarded,
+		Insecure:      config.Insecure,
+		FlushInterval: config.FlushInterval,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.Error("HTTP reverse proxy error", zap.Error(err))
 			w.WriteHeader(http.StatusBadGateway)
 		},
-	}, nil
-}
-
-func newMasqueradeProxyTarget(rawURL string, insecure bool) (*url.URL, http.RoundTripper, error) {
-	target, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, nil, err
-	}
-	switch target.Scheme {
-	case "http", "https":
-		transport := http.DefaultTransport
-		if insecure {
-			tr := http.DefaultTransport.(*http.Transport).Clone()
-			if tr.TLSClientConfig == nil {
-				tr.TLSClientConfig = &tls.Config{}
-			} else {
-				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
-			}
-			tr.TLSClientConfig.InsecureSkipVerify = true
-			transport = tr
-		}
-		return target, transport, nil
-	case "unix":
-		return newUnixMasqueradeProxyTarget(target)
-	case "":
-		if strings.HasPrefix(target.Path, "/") {
-			return newUnixMasqueradeProxyTarget(target)
-		}
-		fallthrough
-	default:
-		return nil, nil, fmt.Errorf("unsupported protocol scheme \"%s\"", target.Scheme)
-	}
-}
-
-func newUnixMasqueradeProxyTarget(parsedURL *url.URL) (*url.URL, http.RoundTripper, error) {
-	if parsedURL.Opaque != "" {
-		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
-	}
-	if parsedURL.User != nil {
-		return nil, nil, errors.New("invalid unix socket URL: userinfo is not supported")
-	}
-	if parsedURL.Host != "" {
-		return nil, nil, errors.New("invalid unix socket URL: host must be empty")
-	}
-	if parsedURL.RawQuery != "" || parsedURL.ForceQuery || parsedURL.Fragment != "" {
-		return nil, nil, errors.New("invalid unix socket URL: query and fragment are not supported")
-	}
-	if parsedURL.Path == "" {
-		return nil, nil, errors.New("empty unix socket path")
-	}
-	if !strings.HasPrefix(parsedURL.Path, "/") {
-		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
-	}
-
-	socketPath := parsedURL.Path
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return dialer.DialContext(ctx, "unix", socketPath)
-	}
-	transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
-	transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
-
-	return &url.URL{Scheme: "http", Host: "localhost"}, transport, nil
+	})
 }
 
 // fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
@@ -1641,12 +1536,17 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 	}
 	hyConfig.MasqHandler = &masqHandlerLogWrapper{H: handler, QUIC: true}
 
+	var tcpServer *masq.MasqTCPServer
 	if c.Masquerade.ListenHTTP != "" || c.Masquerade.ListenHTTPS != "" {
 		if c.Masquerade.ListenHTTP != "" && c.Masquerade.ListenHTTPS == "" {
 			return configError{Field: "masquerade.listenHTTPS", Err: errors.New("having only HTTP server without HTTPS is not supported")}
 		}
-		s := masq.MasqTCPServer{
-			QUICPort:  extractPortFromAddr(hyConfig.Conn.LocalAddr().String()),
+		quicPort, err := advertisedQUICPort(c.Masquerade.AdvertisedQUICPort, hyConfig.Conn.LocalAddr().String())
+		if err != nil {
+			return configError{Field: "masquerade.advertisedQUICPort", Err: err}
+		}
+		tcpServer = &masq.MasqTCPServer{
+			QUICPort:  quicPort,
 			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
 			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
 			TLSConfig: &tls.Config{
@@ -1656,9 +1556,38 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}
-		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
+	}
+
+	closers := make(orderedClosers, 0, 3)
+	if tcpServer != nil {
+		closers = append(closers, tcpServer)
+	}
+	if closer, ok := handler.(io.Closer); ok {
+		closers = append(closers, closer)
+	}
+	if len(closers) > 0 {
+		if hyConfig.Cleanup != nil {
+			closers = append(closers, hyConfig.Cleanup)
+		}
+		hyConfig.Cleanup = closers
+	}
+	if tcpServer != nil {
+		go runMasqTCPServer(tcpServer, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
 	}
 	return nil
+}
+
+// orderedClosers shuts down dependants before the resources they use. In the
+// masquerade case this means listeners first, the upstream transport second,
+// and the pre-existing packet-connection runtime last.
+type orderedClosers []io.Closer
+
+func (c orderedClosers) Close() error {
+	var err error
+	for _, closer := range c {
+		err = errors.Join(err, closer.Close())
+	}
+	return err
 }
 
 // Config validates the fields and returns a ready-to-use Hysteria server config
@@ -1784,7 +1713,7 @@ func runMasqTCPServer(s *masq.MasqTCPServer, httpAddr, httpsAddr string) {
 		}()
 	}
 	err := <-errChan
-	if err != nil {
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Fatal("failed to serve masquerade HTTP(S)", zap.Error(err))
 	}
 }
@@ -1858,6 +1787,16 @@ func extractPortFromAddr(addr string) int {
 		return 0
 	}
 	return port
+}
+
+func advertisedQUICPort(configuredPort int, listenerAddr string) (int, error) {
+	if configuredPort == 0 {
+		return extractPortFromAddr(listenerAddr), nil
+	}
+	if configuredPort < 1 || configuredPort > 65535 {
+		return 0, errors.New("port must be between 1 and 65535")
+	}
+	return configuredPort, nil
 }
 
 // listenUDPAddr resolves the listen string for Mimic's filter. A wildcard host

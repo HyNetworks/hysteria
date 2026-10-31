@@ -3,7 +3,6 @@ package cmd
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"sync/atomic"
 	"testing"
 )
@@ -38,40 +37,22 @@ func BenchmarkMasqueradeProxy(b *testing.B) {
 	b.Cleanup(tcpServer.Close)
 
 	for _, test := range []struct {
-		name       string
-		target     string
-		bufferPool bool
-		cloneTCP   bool
+		name   string
+		target string
 	}{
-		{name: "unix_pooled_buffer", target: socketPath, bufferPool: true},
-		{name: "tcp_32_idle_pooled_buffer", target: tcpServer.URL, bufferPool: true, cloneTCP: true},
-		{name: "unix_unpooled_buffer", target: socketPath, bufferPool: false},
+		{name: "unix", target: socketPath},
+		{name: "tcp", target: tcpServer.URL},
 	} {
 		b.Run(test.name, func(b *testing.B) {
 			handler, err := newMasqueradeProxyHandler(serverConfigMasqueradeProxy{URL: test.target})
 			if err != nil {
 				b.Fatal(err)
 			}
-			proxy := handler.(*httputil.ReverseProxy)
-			transport := proxy.Transport.(*http.Transport)
-			if test.cloneTCP {
-				transport = transport.Clone()
-				transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
-				transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
-				proxy.Transport = transport
-			}
-			b.Cleanup(transport.CloseIdleConnections)
-			if !test.bufferPool {
-				proxy.BufferPool = nil
+			if closer, ok := handler.(interface{ CloseIdleConnections() }); ok {
+				b.Cleanup(closer.CloseIdleConnections)
 			}
 
 			var failures atomic.Int64
-			var firstFailure atomic.Pointer[string]
-			proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-				message := err.Error()
-				firstFailure.CompareAndSwap(nil, &message)
-				w.WriteHeader(http.StatusBadGateway)
-			}
 			b.SetBytes(int64(len(payload)))
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -79,7 +60,7 @@ func BenchmarkMasqueradeProxy(b *testing.B) {
 				for pb.Next() {
 					request := httptest.NewRequest(http.MethodGet, "https://front.example/resource", nil)
 					response := &discardBenchmarkResponseWriter{header: make(http.Header)}
-					proxy.ServeHTTP(response, request)
+					handler.ServeHTTP(response, request)
 					if response.status != http.StatusOK {
 						failures.Add(1)
 					}
@@ -87,11 +68,7 @@ func BenchmarkMasqueradeProxy(b *testing.B) {
 			})
 			b.StopTimer()
 			if count := failures.Load(); count != 0 {
-				message := firstFailure.Load()
-				if message == nil {
-					b.Fatalf("%d proxy requests failed", count)
-				}
-				b.Fatalf("%d proxy requests failed: %s", count, *message)
+				b.Fatalf("%d proxy requests failed", count)
 			}
 		})
 	}
