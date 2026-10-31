@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 )
 
@@ -22,7 +25,7 @@ type MasqTCPServer struct {
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
-	return correctnet.HTTPListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.ForceHTTPS {
 			if s.HTTPSPort == 0 || s.HTTPSPort == 443 {
 				// Omit port if it's the default
@@ -33,7 +36,8 @@ func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
 			return
 		}
 		s.Handler.ServeHTTP(newAltSvcHijackResponseWriter(w, s.QUICPort), r)
-	}))
+	})
+	return correctnet.HTTPListenAndServe(addr, h2c.NewHandler(handler, &http2.Server{}))
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTPS(addr string) error {
