@@ -6,6 +6,7 @@ import (
 
 	"github.com/apernet/hysteria/core/v2/internal/congestion/bbr"
 	"github.com/apernet/hysteria/core/v2/internal/congestion/brutal"
+	"github.com/apernet/hysteria/core/v2/internal/congestion/reno"
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/congestion"
 )
@@ -60,6 +61,12 @@ func seedPacketSize(quicSize, byAddr congestion.ByteCount) congestion.ByteCount 
 
 func UseBrutal(conn *quic.Conn, tx uint64, disableLossCompensation bool) {
 	conn.SetCongestionControl(brutal.NewBrutalSender(tx, disableLossCompensation))
+}
+
+// UseReno explicitly restores Reno after a different controller was installed.
+// UseConfigured intentionally keeps its existing no-op behavior for Reno.
+func UseReno(conn *quic.Conn) {
+	conn.SetCongestionControl(reno.NewSender(conn.InitialPacketSize()))
 }
 
 func UseConfigured(conn *quic.Conn, congestionType, bbrProfile string) {

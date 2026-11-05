@@ -332,6 +332,7 @@ type serverConfigMasquerade struct {
 	ListenHTTP  string                       `mapstructure:"listenHTTP"`
 	ListenHTTPS string                       `mapstructure:"listenHTTPS"`
 	ForceHTTPS  bool                         `mapstructure:"forceHTTPS"`
+	Congestion  *serverConfigCongestion      `mapstructure:"congestion"`
 }
 
 func (c *serverConfig) fillConn(hyConfig *server.Config) error {
@@ -1599,6 +1600,22 @@ func newUnixMasqueradeProxyTarget(parsedURL *url.URL) (*url.URL, http.RoundTripp
 // fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
 // port number from Conn for MasqTCPServer.
 func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
+	// Validate before starting any optional TCP listeners.
+	hyConfig.MasqCongestionConfig = nil
+	if cc := c.Masquerade.Congestion; cc != nil {
+		ccType, err := normalizeCongestionType(cc.Type)
+		if err != nil {
+			return configError{Field: "masquerade.congestion.type", Err: err}
+		}
+		profile := ""
+		if ccType == congestionTypeBBR {
+			profile, err = normalizeBBRProfile(cc.BBRProfile)
+			if err != nil {
+				return configError{Field: "masquerade.congestion.bbrProfile", Err: err}
+			}
+		}
+		hyConfig.MasqCongestionConfig = &server.CongestionConfig{Type: ccType, BBRProfile: profile}
+	}
 	var handler http.Handler
 	switch strings.ToLower(c.Masquerade.Type) {
 	case "", "404":

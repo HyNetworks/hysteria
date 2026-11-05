@@ -41,6 +41,9 @@ type Config struct {
 	EventLogger           EventLogger
 	TrafficLogger         TrafficLogger
 	MasqHandler           http.Handler
+	// MasqCongestionConfig only applies to unauthenticated HTTP/3 requests.
+	// Nil preserves quic-go's default controller, independently of CongestionConfig.
+	MasqCongestionConfig *CongestionConfig
 }
 
 // fill fills the fields that are not set by the user with default values when possible,
@@ -89,6 +92,18 @@ func (c *Config) fill() error {
 		c.CongestionConfig.BBRProfile, err = congestion.NormalizeBBRProfile(c.CongestionConfig.BBRProfile)
 		if err != nil {
 			return errors.ConfigError{Field: "CongestionConfig.BBRProfile", Reason: err.Error()}
+		}
+	}
+	if c.MasqCongestionConfig != nil {
+		c.MasqCongestionConfig.Type, err = congestion.NormalizeType(c.MasqCongestionConfig.Type)
+		if err != nil {
+			return errors.ConfigError{Field: "MasqCongestionConfig.Type", Reason: err.Error()}
+		}
+		if c.MasqCongestionConfig.Type == congestion.TypeBBR {
+			c.MasqCongestionConfig.BBRProfile, err = congestion.NormalizeBBRProfile(c.MasqCongestionConfig.BBRProfile)
+			if err != nil {
+				return errors.ConfigError{Field: "MasqCongestionConfig.BBRProfile", Reason: err.Error()}
+			}
 		}
 	}
 	if c.Conn == nil {

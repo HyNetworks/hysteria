@@ -206,6 +206,10 @@ func TestServerConfig(t *testing.T) {
 		},
 		Masquerade: serverConfigMasquerade{
 			Type: "proxy",
+			Congestion: &serverConfigCongestion{
+				Type:       "bbr",
+				BBRProfile: "conservative",
+			},
 			File: serverConfigMasqueradeFile{
 				Dir: "/www/masq",
 			},

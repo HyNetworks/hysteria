@@ -150,6 +150,12 @@ type h3sHandler struct {
 	connID        uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
+
+	// Serialize controller installation, not HTTP response delivery. A connection
+	// can carry concurrent masquerade and authentication requests.
+	congestionMutex    sync.Mutex
+	masqCongestionSet  bool
+	proxyCongestionSet bool
 }
 
 func newH3sHandler(config *Config, conn *quic.Conn) *h3sHandler {
@@ -181,9 +187,10 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Set authenticated flag
 			h.authenticated = true
 			h.authID = id
+			h.congestionMutex.Lock()
 			if h.config.IgnoreClientBandwidth {
 				// Ignore client bandwidth and use the configured congestion controller.
-				congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
+				h.useProxyCongestion()
 				actualTx = 0
 			} else {
 				// actualTx = min(serverTx, clientRx)
@@ -196,9 +203,11 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					congestion.UseBrutal(h.conn, actualTx, h.config.BandwidthConfig.DisableLossCompensation)
 				} else {
 					// Client doesn't know its own bandwidth, use the configured congestion controller.
-					congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
+					h.useProxyCongestion()
 				}
 			}
+			h.proxyCongestionSet = true
+			h.congestionMutex.Unlock()
 			// Auth OK, send response
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
 				UDPEnabled: !h.config.DisableUDP,
@@ -347,7 +356,34 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}
 }
 
+// useProxyCongestion is called with congestionMutex held. Normally Reno needs
+// no installation. If this connection previously served the website using BBR,
+// explicitly replace it so the website configuration cannot leak into proxying.
+func (h *h3sHandler) useProxyCongestion() {
+	if h.config.CongestionConfig.Type == congestion.TypeReno && h.masqCongestionSet &&
+		h.config.MasqCongestionConfig.Type == congestion.TypeBBR {
+		congestion.UseReno(h.conn)
+		return
+	}
+	congestion.UseConfigured(h.conn, h.config.CongestionConfig.Type, h.config.CongestionConfig.BBRProfile)
+}
+
+func (h *h3sHandler) initMasqCongestion() {
+	if h.config.MasqCongestionConfig == nil {
+		return
+	}
+	h.congestionMutex.Lock()
+	defer h.congestionMutex.Unlock()
+	if h.masqCongestionSet || h.proxyCongestionSet {
+		return
+	}
+	cc := h.config.MasqCongestionConfig
+	congestion.UseConfigured(h.conn, cc.Type, cc.BBRProfile)
+	h.masqCongestionSet = true
+}
+
 func (h *h3sHandler) masqHandler(w http.ResponseWriter, r *http.Request) {
+	h.initMasqCongestion()
 	if h.config.MasqHandler != nil {
 		h.config.MasqHandler.ServeHTTP(w, r)
 	} else {

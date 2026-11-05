@@ -164,6 +164,9 @@ trafficStats:
 
 masquerade:
   type: proxy
+  congestion:
+    type: bbr
+    bbrProfile: conservative
   file:
     dir: /www/masq
   proxy:
