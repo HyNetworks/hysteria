@@ -21,6 +21,11 @@ import (
 const (
 	closeErrCodeOK            = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeProtocolError = 0x101 // HTTP3 ErrCodeGeneralProtocolError
+
+	// The TCP response wait outlasts the QUIC idle timeout (a dead connection is
+	// still reported by QUIC itself) and leaves room for the server-side dial.
+	tcpResponseMinTimeout   = 30 * time.Second
+	tcpResponseExtraTimeout = 15 * time.Second
 )
 
 type Client interface {
@@ -212,12 +217,15 @@ func (c *clientImpl) TCP(addr string) (net.Conn, error) {
 			Established:      false,
 		}, nil
 	}
-	// Read response
+	// Read response, without blocking forever on a server that never answers
+	timeout := max(c.config.QUICConfig.MaxIdleTimeout, tcpResponseMinTimeout) + tcpResponseExtraTimeout
+	_ = stream.SetReadDeadline(time.Now().Add(timeout))
 	ok, msg, err := protocol.ReadTCPResponse(stream)
 	if err != nil {
 		_ = stream.Close()
 		return nil, wrapIfConnectionClosed(err)
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 	if !ok {
 		_ = stream.Close()
 		return nil, coreErrs.DialError{Message: msg}
