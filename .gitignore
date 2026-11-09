@@ -470,3 +470,6 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/goland+all,intellij+all,go,windows,linux,macos,python,pycharm+all
 
 test-configs/
+
+# Saved VxHy binaries for restore. Not source.
+baselines/

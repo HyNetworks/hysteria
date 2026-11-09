@@ -119,3 +119,19 @@ tun:
     ipv6: [ "2000::/3" ]
     ipv4Exclude: [ 192.0.2.1/32 ]
     ipv6Exclude: [ "2001:db8::1/128" ]
+
+l3tun:
+  name: hytun0
+  mtu: 1600
+  address: 10.200.0.2/30
+  peer: 10.200.0.1
+  mode: stream
+  lanes: 8
+  type: tun
+  filter: vxlan
+  relay:
+    listen: 127.0.0.1:4789
+    vnis:
+      - vni: 500
+        vtep: 192.168.7.1:4789
+        allow: [ 192.168.7.0/24 ]

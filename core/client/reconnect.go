@@ -3,6 +3,7 @@ package client
 import (
 	"net"
 	"sync"
+	"time"
 
 	coreErrs "github.com/apernet/hysteria/core/v2/errors"
 )
@@ -107,6 +108,128 @@ func (rc *reconnectableClientImpl) UDP() (HyUDPConn, error) {
 	} else {
 		return c.(HyUDPConn), nil
 	}
+}
+
+func (rc *reconnectableClientImpl) L3() (HyL3Conn, error) {
+	return &reL3{rc: rc}, nil
+}
+
+func (rc *reconnectableClientImpl) drop(owner Client) {
+	rc.m.Lock()
+	defer rc.m.Unlock()
+	if rc.client == owner {
+		_ = rc.client.Close()
+		rc.client = nil
+	}
+}
+
+func (rc *reconnectableClientImpl) isClosed() bool {
+	rc.m.Lock()
+	defer rc.m.Unlock()
+	return rc.closed
+}
+
+// reL3 keeps a TUN reading and writing across QUIC reconnects.
+// A closed connection is dropped and dialed again. A permanent Close stops the loop.
+type reL3 struct {
+	rc      *reconnectableClientImpl
+	mu      sync.Mutex
+	inner   HyL3Conn
+	owner   Client
+	dialing bool
+}
+
+func (r *reL3) Send(ipPkt []byte) error {
+	for {
+		inner, err := r.conn()
+		if err != nil {
+			return err
+		}
+		err = inner.Send(ipPkt)
+		if _, ok := err.(coreErrs.ClosedError); ok {
+			r.reset(inner)
+			continue
+		}
+		return err
+	}
+}
+
+func (r *reL3) Receive() ([]byte, error) {
+	for {
+		inner, err := r.conn()
+		if err != nil {
+			return nil, err
+		}
+		pkt, err := inner.Receive()
+		if _, ok := err.(coreErrs.ClosedError); ok {
+			r.reset(inner)
+			continue
+		}
+		return pkt, err
+	}
+}
+
+func (r *reL3) conn() (HyL3Conn, error) {
+	r.mu.Lock()
+	for {
+		if r.inner != nil {
+			inner := r.inner
+			r.mu.Unlock()
+			return inner, nil
+		}
+		if r.dialing {
+			r.mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			r.mu.Lock()
+			continue
+		}
+		r.dialing = true
+		r.mu.Unlock()
+
+		inner, owner, err := r.dial()
+
+		r.mu.Lock()
+		r.dialing = false
+		if err != nil {
+			r.mu.Unlock()
+			return nil, err
+		}
+		if r.inner == nil {
+			r.inner = inner
+			r.owner = owner
+		}
+		got := r.inner
+		r.mu.Unlock()
+		return got, nil
+	}
+}
+
+func (r *reL3) dial() (HyL3Conn, Client, error) {
+	for {
+		var owner Client
+		v, err := r.rc.clientDo(func(c Client) (interface{}, error) {
+			owner = c
+			return c.L3()
+		})
+		if err == nil {
+			return v.(HyL3Conn), owner, nil
+		}
+		if _, ok := err.(coreErrs.DialError); ok || r.rc.isClosed() {
+			return nil, nil, err
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func (r *reL3) reset(inner HyL3Conn) {
+	r.mu.Lock()
+	owner := r.owner
+	if r.inner == inner {
+		r.inner = nil
+		r.owner = nil
+	}
+	r.mu.Unlock()
+	r.rc.drop(owner)
 }
 
 func (rc *reconnectableClientImpl) Close() error {

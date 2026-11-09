@@ -185,6 +185,10 @@ func (c failingHyClient) UDP() (client.HyUDPConn, error) {
 	return nil, c.err
 }
 
+func (c failingHyClient) L3() (client.HyL3Conn, error) {
+	return nil, c.err
+}
+
 func (c failingHyClient) Close() error {
 	return nil
 }
@@ -204,6 +208,10 @@ func (c scriptedHyClient) TCP(addr string) (net.Conn, error) {
 
 func (c scriptedHyClient) UDP() (client.HyUDPConn, error) {
 	return c.udp, nil
+}
+
+func (c scriptedHyClient) L3() (client.HyL3Conn, error) {
+	return nil, errors.New("L3 not enabled")
 }
 
 func (c scriptedHyClient) Close() error {
