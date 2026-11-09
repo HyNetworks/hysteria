@@ -104,15 +104,14 @@ func TestCompile(t *testing.T) {
 			HijackAddress: "",
 		},
 	}
-	comp, err := Compile[int](rules, map[string]int{
+	engines := compileBoth(t, rules, map[string]int{
 		"ob1": ob1,
 		"ob2": ob2,
 		"ob3": ob3,
 		"ob4": ob4,
 		"ob5": ob5,
 		"ob6": ob6,
-	}, 100, &testGeoLoader{})
-	assert.NoError(t, err)
+	})
 
 	tests := []struct {
 		host         HostInfo
@@ -336,13 +335,15 @@ func TestCompile(t *testing.T) {
 		},
 	}
 
-	for _, test := range tests {
-		testName := fmt.Sprintf("%s#%s#%d", test.host, test.proto, test.port)
-		t.Run(testName, func(t *testing.T) {
-			gotOutbound, gotIP := comp.Match(test.host, test.proto, test.port)
-			assert.Equal(t, test.wantOutbound, gotOutbound)
-			assert.Equal(t, test.wantIP, gotIP)
-		})
+	for _, engine := range engines {
+		for _, test := range tests {
+			testName := fmt.Sprintf("%s/%s|%s|%s#%s#%d", engine.Name, test.host.Name, test.host.IPv4, test.host.IPv6, test.proto, test.port)
+			t.Run(testName, func(t *testing.T) {
+				gotOutbound, gotIP := engine.Match(test.host, test.proto, test.port)
+				assert.Equal(t, test.wantOutbound, gotOutbound)
+				assert.Equal(t, test.wantIP, gotIP)
+			})
+		}
 	}
 
 	// Test Invalid Port Range Rule
@@ -356,10 +357,41 @@ func TestCompile(t *testing.T) {
 		},
 	}
 
-	_, err = Compile[int](invalidRules, map[string]int{
+	_, err := legacyCompile[int](invalidRules, map[string]int{
 		"eb1": eb1,
 	}, 100, &testGeoLoader{})
 	assert.Error(t, err)
+	_, err = translateTextRules(invalidRules, "")
+	assert.Error(t, err)
+}
+
+type testEngine struct {
+	Name  string
+	Match func(host HostInfo, proto Protocol, port uint16) (int, net.IP)
+}
+
+// compileBoth compiles legacy rules with both the legacy compiler and the
+// expr engine (through translation), so tests can run against both.
+func compileBoth(t *testing.T, rules []TextRule, outbounds map[string]int) []testEngine {
+	t.Helper()
+	legacy, err := legacyCompile[int](rules, outbounds, 100, &testGeoLoader{})
+	assert.NoError(t, err)
+	translated, err := translateTextRules(rules, "")
+	assert.NoError(t, err)
+	compiled, err := Compile[int](translated, outbounds, 100, &testGeoLoader{})
+	assert.NoError(t, err)
+	return []testEngine{
+		{"legacy", legacy.Match},
+		{"expr", func(host HostInfo, proto Protocol, port uint16) (int, net.IP) {
+			return compiled.Match(&Request{
+				Proto: proto,
+				Host:  host.Name,
+				Port:  port,
+				IPv4:  host.IPv4,
+				IPv6:  host.IPv6,
+			})
+		}},
+	}
 }
 
 func Test_parseGeoSiteName(t *testing.T) {

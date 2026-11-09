@@ -133,6 +133,15 @@ acl:
   inline:
     - lmao(ok)
     - kek(cringe,boba,tea)
+  rules:
+    - outbound: alice_exit
+      match: auth.id == "alice"
+    - outbound: default
+      match: dst.port == 53
+      hijack: 1.1.1.1
+    - legacy: reject(geoip:cn)
+    - legacyFile: legacy_acl.txt
+  rulesFile: acl_rules.yaml
   geoip: some.dat
   geosite: some_site.dat
   geoUpdateInterval: 168h

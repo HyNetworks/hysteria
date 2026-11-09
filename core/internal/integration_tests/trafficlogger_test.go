@@ -61,7 +61,7 @@ func TestClientServerTrafficLoggerTCP(t *testing.T) {
 		sobConnChCloseFunc()
 		return nil
 	})
-	serverOb.EXPECT().TCP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().TCP(mock.Anything, addr).Return(sobConn, nil).Once()
 	trafficLogger.EXPECT().TraceStream(mock.Anything, mock.Anything).Return().Once()
 
 	conn, err := c.TCP(addr)
@@ -145,7 +145,7 @@ func TestClientServerTrafficLoggerUDP(t *testing.T) {
 		sobConnChCloseFunc()
 		return nil
 	})
-	serverOb.EXPECT().UDP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().UDP(mock.Anything, addr).Return(sobConn, nil).Once()
 
 	conn, err := c.UDP()
 	assert.NoError(t, err)

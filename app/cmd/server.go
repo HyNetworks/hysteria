@@ -243,11 +243,13 @@ type serverConfigSniff struct {
 }
 
 type serverConfigACL struct {
-	File              string        `mapstructure:"file"`
-	Inline            []string      `mapstructure:"inline"`
-	GeoIP             string        `mapstructure:"geoip"`
-	GeoSite           string        `mapstructure:"geosite"`
-	GeoUpdateInterval time.Duration `mapstructure:"geoUpdateInterval"`
+	File              string                `mapstructure:"file"`   // Legacy syntax
+	Inline            []string              `mapstructure:"inline"` // Legacy syntax
+	Rules             []serverConfigACLRule `mapstructure:"rules"`
+	RulesFile         string                `mapstructure:"rulesFile"`
+	GeoIP             string                `mapstructure:"geoip"`
+	GeoSite           string                `mapstructure:"geosite"`
+	GeoUpdateInterval time.Duration         `mapstructure:"geoUpdateInterval"`
 }
 
 type serverConfigOutboundDirect struct {
@@ -1298,7 +1300,47 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 	// Depending on the config, we build a chain like this:
 	// Resolver(ACL(Outbounds...))
 
-	// Outbounds
+	obs, err := c.outboundEntries()
+	if err != nil {
+		return err
+	}
+
+	var uOb outbounds.PluggableOutbound // "unified" outbound
+
+	// ACL
+	aclRules, aclField, err := c.ACL.aclRules()
+	if err != nil {
+		return configError{Field: aclField, Err: err}
+	}
+	hasACL := aclField != ""
+	if hasACL {
+		uOb, err = outbounds.NewACLEngine(aclRules, obs, c.geoLoader())
+		if err != nil {
+			return configError{Field: aclField, Err: err}
+		}
+	} else {
+		// No ACL, use the first outbound
+		uOb = obs[0].Outbound
+	}
+
+	// Resolver
+	uOb, err = c.wrapResolver(uOb, hasACL)
+	if err != nil {
+		return err
+	}
+
+	// Speed test
+	if c.SpeedTest {
+		uOb = outbounds.NewSpeedtestHandler(uOb)
+	}
+
+	hyConfig.Outbound = &outbounds.PluggableOutboundAdapter{PluggableOutbound: uOb}
+	return nil
+}
+
+// outboundEntries creates the outbounds from the config.
+// It always returns at least one outbound.
+func (c *serverConfig) outboundEntries() ([]outbounds.OutboundEntry, error) {
 	var obs []outbounds.OutboundEntry
 	if len(c.Outbounds) == 0 {
 		// Guarantee we have at least one outbound
@@ -1310,7 +1352,7 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 		obs = make([]outbounds.OutboundEntry, len(c.Outbounds))
 		for i, entry := range c.Outbounds {
 			if entry.Name == "" {
-				return configError{Field: "outbounds.name", Err: errors.New("empty outbound name")}
+				return nil, configError{Field: "outbounds.name", Err: errors.New("empty outbound name")}
 			}
 			var ob outbounds.PluggableOutbound
 			var err error
@@ -1325,85 +1367,60 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 				err = configError{Field: "outbounds.type", Err: errors.New("unsupported outbound type")}
 			}
 			if err != nil {
-				return err
+				return nil, err
 			}
 			obs[i] = outbounds.OutboundEntry{Name: entry.Name, Outbound: ob}
 		}
 	}
 
-	var uOb outbounds.PluggableOutbound // "unified" outbound
+	return obs, nil
+}
 
-	// ACL
-	hasACL := false
-	if c.ACL.File != "" && len(c.ACL.Inline) > 0 {
-		return configError{Field: "acl", Err: errors.New("cannot set both acl.file and acl.inline")}
-	}
-	gLoader := &utils.GeoLoader{
+func (c *serverConfig) geoLoader() *utils.GeoLoader {
+	return &utils.GeoLoader{
 		GeoIPFilename:   c.ACL.GeoIP,
 		GeoSiteFilename: c.ACL.GeoSite,
 		UpdateInterval:  c.ACL.GeoUpdateInterval,
 		DownloadFunc:    geoDownloadFunc,
 		DownloadErrFunc: geoDownloadErrFunc,
 	}
-	if c.ACL.File != "" {
-		hasACL = true
-		acl, err := outbounds.NewACLEngineFromFile(c.ACL.File, obs, gLoader)
-		if err != nil {
-			return configError{Field: "acl.file", Err: err}
-		}
-		uOb = acl
-	} else if len(c.ACL.Inline) > 0 {
-		hasACL = true
-		acl, err := outbounds.NewACLEngineFromString(strings.Join(c.ACL.Inline, "\n"), obs, gLoader)
-		if err != nil {
-			return configError{Field: "acl.inline", Err: err}
-		}
-		uOb = acl
-	} else {
-		// No ACL, use the first outbound
-		uOb = obs[0].Outbound
-	}
+}
 
-	// Resolver
+// wrapResolver puts the configured resolver in front of next.
+func (c *serverConfig) wrapResolver(next outbounds.PluggableOutbound, hasACL bool) (outbounds.PluggableOutbound, error) {
 	switch strings.ToLower(c.Resolver.Type) {
 	case "", "system":
 		if hasACL {
 			// If the user uses ACL, we must put a resolver in front of it,
 			// for IP rules to work on domain requests.
-			uOb = outbounds.NewSystemResolver(uOb)
+			next = outbounds.NewSystemResolver(next)
 		}
 		// Otherwise we can just rely on outbound handling on its own.
 	case "tcp":
 		if c.Resolver.TCP.Addr == "" {
-			return configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.tcp.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, uOb)
+		next = outbounds.NewStandardResolverTCP(c.Resolver.TCP.Addr, c.Resolver.TCP.Timeout, next)
 	case "udp":
 		if c.Resolver.UDP.Addr == "" {
-			return configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.udp.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, uOb)
+		next = outbounds.NewStandardResolverUDP(c.Resolver.UDP.Addr, c.Resolver.UDP.Timeout, next)
 	case "tls", "tcp-tls":
 		if c.Resolver.TLS.Addr == "" {
-			return configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.tls.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, uOb)
+		next = outbounds.NewStandardResolverTLS(c.Resolver.TLS.Addr, c.Resolver.TLS.Timeout, c.Resolver.TLS.SNI, c.Resolver.TLS.Insecure, next)
 	case "https", "http":
 		if c.Resolver.HTTPS.Addr == "" {
-			return configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
+			return nil, configError{Field: "resolver.https.addr", Err: errors.New("empty resolver address")}
 		}
-		uOb = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, uOb)
+		next = outbounds.NewDoHResolver(c.Resolver.HTTPS.Addr, c.Resolver.HTTPS.Timeout, c.Resolver.HTTPS.SNI, c.Resolver.HTTPS.Insecure, next)
 	default:
-		return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
+		return nil, configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
 	}
 
-	// Speed test
-	if c.SpeedTest {
-		uOb = outbounds.NewSpeedtestHandler(uOb)
-	}
-
-	hyConfig.Outbound = &outbounds.PluggableOutboundAdapter{PluggableOutbound: uOb}
-	return nil
+	return next, nil
 }
 
 func (c *serverConfig) fillBandwidthConfig(hyConfig *server.Config) error {
