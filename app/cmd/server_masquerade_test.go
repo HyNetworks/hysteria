@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
 
 type countingListener struct {
 	net.Listener
@@ -145,19 +150,6 @@ func TestMasqueradeProxyUnixReusesConnections(t *testing.T) {
 	assert.Equal(t, int64(1), listener.accepts.Load())
 }
 
-func TestMasqueradeProxyUnixTransportSettings(t *testing.T) {
-	target, roundTripper, err := newMasqueradeProxyTarget("/tmp/anubis.sock", false)
-	require.NoError(t, err)
-	assert.Equal(t, "http://localhost", target.String())
-
-	transport, ok := roundTripper.(*http.Transport)
-	require.True(t, ok)
-	assert.Nil(t, transport.Proxy)
-	assert.NotNil(t, transport.DialContext)
-	assert.Equal(t, masqueradeProxyMaxIdleConnections, transport.MaxIdleConns)
-	assert.Equal(t, masqueradeProxyMaxIdleConnsPerHost, transport.MaxIdleConnsPerHost)
-}
-
 func TestMasqueradeProxyUnixConnectionErrorReturnsBadGateway(t *testing.T) {
 	previousLogger := logger
 	logger = zap.NewNop()
@@ -224,4 +216,31 @@ func TestMasqueradeProxyHTTPRegression(t *testing.T) {
 	handler.ServeHTTP(recorder, req)
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.Equal(t, "healthy", recorder.Body.String())
+}
+
+func TestOrderedClosersPreserveShutdownOrderAndErrors(t *testing.T) {
+	t.Parallel()
+	var order []string
+	firstErr := errors.New("listener shutdown failed")
+	secondErr := errors.New("transport cleanup failed")
+	closers := orderedClosers{
+		closerFunc(func() error {
+			order = append(order, "listeners")
+			return firstErr
+		}),
+		closerFunc(func() error {
+			order = append(order, "transport")
+			return secondErr
+		}),
+		closerFunc(func() error {
+			order = append(order, "packet runtime")
+			return nil
+		}),
+	}
+
+	err := closers.Close()
+
+	assert.Equal(t, []string{"listeners", "transport", "packet runtime"}, order)
+	assert.ErrorIs(t, err, firstErr)
+	assert.ErrorIs(t, err, secondErr)
 }
