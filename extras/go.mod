@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
-	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
+	github.com/apernet/quic-go v0.65.1-0.20261109005002-2895f039137a
 	github.com/database64128/tfo-go/v2 v2.3.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138
