@@ -6,6 +6,7 @@ require (
 	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
 	github.com/apernet/quic-go v0.65.1-0.20261109005002-2895f039137a
 	github.com/database64128/tfo-go/v2 v2.3.3
+	github.com/expr-lang/expr v1.17.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138
 	github.com/miekg/dns v1.1.72

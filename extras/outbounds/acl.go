@@ -3,7 +3,6 @@ package outbounds
 import (
 	"errors"
 	"net"
-	"os"
 	"strings"
 
 	"github.com/apernet/hysteria/extras/v2/outbounds/acl"
@@ -33,25 +32,14 @@ type OutboundEntry struct {
 	Outbound PluggableOutbound
 }
 
-func NewACLEngineFromString(rules string, outbounds []OutboundEntry, geoLoader acl.GeoLoader) (PluggableOutbound, error) {
-	trs, err := acl.ParseTextRules(rules)
-	if err != nil {
-		return nil, err
-	}
+// NewACLEngine creates an ACL engine from expr-based rules.
+func NewACLEngine(rules []acl.Rule, outbounds []OutboundEntry, geoLoader acl.GeoLoader) (PluggableOutbound, error) {
 	obMap := outboundsToMap(outbounds)
-	rs, err := acl.Compile[PluggableOutbound](trs, obMap, aclCacheSize, geoLoader)
+	rs, err := acl.Compile[PluggableOutbound](rules, obMap, aclCacheSize, geoLoader)
 	if err != nil {
 		return nil, err
 	}
 	return &aclEngine{rs, obMap["default"]}, nil
-}
-
-func NewACLEngineFromFile(filename string, outbounds []OutboundEntry, geoLoader acl.GeoLoader) (PluggableOutbound, error) {
-	bs, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	return NewACLEngineFromString(string(bs), outbounds, geoLoader)
 }
 
 func outboundsToMap(outbounds []OutboundEntry) map[string]PluggableOutbound {
@@ -77,12 +65,20 @@ func outboundsToMap(outbounds []OutboundEntry) map[string]PluggableOutbound {
 }
 
 func (a *aclEngine) handle(reqAddr *AddrEx, proto acl.Protocol) PluggableOutbound {
-	hostInfo := acl.HostInfo{Name: reqAddr.Host}
-	if reqAddr.ResolveInfo != nil {
-		hostInfo.IPv4 = reqAddr.ResolveInfo.IPv4
-		hostInfo.IPv6 = reqAddr.ResolveInfo.IPv6
+	req := acl.Request{
+		Proto: proto,
+		Host:  reqAddr.Host,
+		Port:  reqAddr.Port,
 	}
-	ob, hijackIP := a.RuleSet.Match(hostInfo, proto, reqAddr.Port)
+	if reqAddr.ResolveInfo != nil {
+		req.IPv4 = reqAddr.ResolveInfo.IPv4
+		req.IPv6 = reqAddr.ResolveInfo.IPv6
+	}
+	if reqAddr.Info != nil {
+		req.AuthID = reqAddr.Info.AuthID
+		req.ClientAddr = reqAddr.Info.ClientAddr
+	}
+	ob, hijackIP := a.RuleSet.Match(&req)
 	if ob == nil {
 		// No match, use default outbound
 		return a.Default

@@ -219,7 +219,14 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
+						&udpIOImpl{
+							Conn:          h.conn,
+							AuthID:        id,
+							TrafficLogger: h.config.TrafficLogger,
+							RequestHook:   h.config.RequestHook,
+							Outbound:      h.config.Outbound,
+							RequestInfo:   &RequestInfo{AuthID: id, ClientAddr: h.conn.RemoteAddr()},
+						},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout,
 					)
@@ -307,7 +314,10 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}
 	// Dial target
 	streamStats.State.Store(StreamStateConnecting)
-	tConn, err := h.config.Outbound.TCP(reqAddr)
+	tConn, err := h.config.Outbound.TCP(&RequestInfo{
+		AuthID:     h.authID,
+		ClientAddr: h.conn.RemoteAddr(),
+	}, reqAddr)
 	if err != nil {
 		if !hooked {
 			_ = protocol.WriteTCPResponse(stream, false, err.Error())
@@ -363,6 +373,7 @@ type udpIOImpl struct {
 	TrafficLogger TrafficLogger
 	RequestHook   RequestHook
 	Outbound      Outbound
+	RequestInfo   *RequestInfo
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
@@ -415,11 +426,11 @@ func (io *udpIOImpl) Hook(packets [][]byte, reqAddr *string) (bool, error) {
 }
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
-	return io.Outbound.UDP(reqAddr)
+	return io.Outbound.UDP(io.RequestInfo, reqAddr)
 }
 
 func (io *udpIOImpl) CheckUDP(reqAddr string) error {
-	return io.Outbound.CheckUDP(reqAddr)
+	return io.Outbound.CheckUDP(io.RequestInfo, reqAddr)
 }
 
 type udpEventLoggerImpl struct {

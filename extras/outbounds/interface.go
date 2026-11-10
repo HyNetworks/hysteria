@@ -44,6 +44,7 @@ type AddrEx struct {
 	Host        string // String representation of the host, can be an IP or a domain name
 	Port        uint16
 	ResolveInfo *ResolveInfo // Only set if there's a resolver in the pipeline
+	Info        *server.RequestInfo
 }
 
 func (a *AddrEx) String() string {
@@ -76,7 +77,7 @@ func parsePortUint16(port string) (uint16, error) {
 	return uint16(portUint), nil
 }
 
-func (a *PluggableOutboundAdapter) TCP(reqAddr string) (net.Conn, error) {
+func (a *PluggableOutboundAdapter) TCP(info *server.RequestInfo, reqAddr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(reqAddr)
 	if err != nil {
 		return nil, err
@@ -88,10 +89,11 @@ func (a *PluggableOutboundAdapter) TCP(reqAddr string) (net.Conn, error) {
 	return a.PluggableOutbound.TCP(&AddrEx{
 		Host: host,
 		Port: portUint,
+		Info: info,
 	})
 }
 
-func (a *PluggableOutboundAdapter) UDP(reqAddr string) (server.UDPConn, error) {
+func (a *PluggableOutboundAdapter) UDP(info *server.RequestInfo, reqAddr string) (server.UDPConn, error) {
 	host, port, err := net.SplitHostPort(reqAddr)
 	if err != nil {
 		return nil, err
@@ -103,6 +105,7 @@ func (a *PluggableOutboundAdapter) UDP(reqAddr string) (server.UDPConn, error) {
 	conn, err := a.PluggableOutbound.UDP(&AddrEx{
 		Host: host,
 		Port: portUint,
+		Info: info,
 	})
 	if err != nil {
 		return nil, err
@@ -110,7 +113,7 @@ func (a *PluggableOutboundAdapter) UDP(reqAddr string) (server.UDPConn, error) {
 	return &udpConnAdapter{conn}, nil
 }
 
-func (a *PluggableOutboundAdapter) CheckUDP(reqAddr string) error {
+func (a *PluggableOutboundAdapter) CheckUDP(info *server.RequestInfo, reqAddr string) error {
 	host, port, err := net.SplitHostPort(reqAddr)
 	if err != nil {
 		return err
@@ -122,6 +125,7 @@ func (a *PluggableOutboundAdapter) CheckUDP(reqAddr string) error {
 	return a.PluggableOutbound.CheckUDP(&AddrEx{
 		Host: host,
 		Port: portUint,
+		Info: info,
 	})
 }
 
