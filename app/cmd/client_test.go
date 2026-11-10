@@ -102,6 +102,7 @@ func TestClientConfig(t *testing.T) {
 			Username:   "anon",
 			Password:   "bro",
 			DisableUDP: true,
+			Timeout:    30 * time.Second,
 		},
 		HTTP: &httpConfig{
 			Listen:   "127.0.0.1:8080",
