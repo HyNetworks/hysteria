@@ -43,6 +43,18 @@ my_custom_outbound2(all)
 			wantErr: false,
 		},
 		{
+			name: "hyphen in outbound name",
+			text: `
+New-turkey(geosite:cn)
+us-west-1(all, udp/443)
+`,
+			want: []TextRule{
+				{Outbound: "New-turkey", Address: "geosite:cn", LineNum: 2},
+				{Outbound: "us-west-1", Address: "all", ProtoPort: "udp/443", LineNum: 3},
+			},
+			wantErr: false,
+		},
+		{
 			name:    "fail 1",
 			text:    `boom()`,
 			want:    nil,
