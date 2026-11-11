@@ -25,23 +25,25 @@ type TrafficStatsServer interface {
 	http.Handler
 }
 
-func NewTrafficStatsServer(secret string) TrafficStatsServer {
+func NewTrafficStatsServer(secret string, disableDumpStreams bool) TrafficStatsServer {
 	return &trafficStatsServerImpl{
-		StatsMap:  make(map[string]*trafficStatsEntry),
-		KickMap:   make(map[string]struct{}),
-		OnlineMap: make(map[string]int),
-		StreamMap: make(map[server.HyStream]*server.StreamStats),
-		Secret:    secret,
+		StatsMap:           make(map[string]*trafficStatsEntry),
+		KickMap:            make(map[string]struct{}),
+		OnlineMap:          make(map[string]int),
+		StreamMap:          make(map[server.HyStream]*server.StreamStats),
+		Secret:             secret,
+		DisableDumpStreams: disableDumpStreams,
 	}
 }
 
 type trafficStatsServerImpl struct {
-	Mutex     sync.RWMutex
-	StatsMap  map[string]*trafficStatsEntry
-	OnlineMap map[string]int
-	StreamMap map[server.HyStream]*server.StreamStats
-	KickMap   map[string]struct{}
-	Secret    string
+	Mutex              sync.RWMutex
+	StatsMap           map[string]*trafficStatsEntry
+	OnlineMap          map[string]int
+	StreamMap          map[server.HyStream]*server.StreamStats
+	KickMap            map[string]struct{}
+	Secret             string
+	DisableDumpStreams bool
 }
 
 type trafficStatsEntry struct {
@@ -86,6 +88,9 @@ func (s *trafficStatsServerImpl) LogOnlineState(id string, online bool) {
 }
 
 func (s *trafficStatsServerImpl) TraceStream(stream server.HyStream, stats *server.StreamStats) {
+	if s.DisableDumpStreams {
+		return
+	}
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
@@ -93,6 +98,9 @@ func (s *trafficStatsServerImpl) TraceStream(stream server.HyStream, stats *serv
 }
 
 func (s *trafficStatsServerImpl) UntraceStream(stream server.HyStream) {
+	if s.DisableDumpStreams {
+		return
+	}
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
@@ -233,6 +241,10 @@ func (e *dumpStreamEntry) String() string {
 }
 
 func (s *trafficStatsServerImpl) getDumpStreams(w http.ResponseWriter, r *http.Request) {
+	if s.DisableDumpStreams {
+		http.Error(w, "dump streams is disabled (trafficStats.disableDumpStreams)", http.StatusForbidden)
+		return
+	}
 	var entries []dumpStreamEntry
 
 	s.Mutex.RLock()

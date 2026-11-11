@@ -170,6 +170,7 @@ outbounds:
 trafficStats:
   listen: :9999
   secret: its_me_mario
+  disableDumpStreams: true
 
 masquerade:
   type: proxy

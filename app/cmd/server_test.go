@@ -210,6 +210,7 @@ func TestServerConfig(t *testing.T) {
 		TrafficStats: serverConfigTrafficStats{
 			Listen: ":9999",
 			Secret: "its_me_mario",
+			DisableDumpStreams: true,
 		},
 		Masquerade: serverConfigMasquerade{
 			Type: "proxy",
