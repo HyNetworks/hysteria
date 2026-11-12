@@ -162,6 +162,7 @@ type clientConfigTLS struct {
 }
 
 type clientConfigQUIC struct {
+	ConnectionPoolSize          int                      `mapstructure:"connectionPoolSize"`
 	InitStreamReceiveWindow     uint64                   `mapstructure:"initStreamReceiveWindow"`
 	MaxStreamReceiveWindow      uint64                   `mapstructure:"maxStreamReceiveWindow"`
 	InitConnectionReceiveWindow uint64                   `mapstructure:"initConnReceiveWindow"`
@@ -835,6 +836,30 @@ func runClientCmd(cmd *cobra.Command, args []string) {
 	runClient(defaultViper)
 }
 
+func (c *clientConfig) connectionPoolSize() (int, error) {
+	size := c.QUIC.ConnectionPoolSize
+	if size == 0 {
+		size = 1
+	}
+	if size < 1 || size > client.MaxConnectionPoolSize {
+		return 0, configError{Field: "quic.connectionPoolSize", Err: fmt.Errorf("must be between 1 and %d (or 0 for the default)", client.MaxConnectionPoolSize)}
+	}
+	if size > 1 {
+		if _, ok, err := c.parseRealmAddr(); ok || err != nil {
+			return 0, configError{Field: "quic.connectionPoolSize", Err: errors.New("connection pooling is not supported in realm mode")}
+		}
+	}
+	return size, nil
+}
+
+func (c *clientConfig) newClient(connectedFunc func(client.Client, *client.HandshakeInfo, int)) (client.Client, error) {
+	size, err := c.connectionPoolSize()
+	if err != nil {
+		return nil, err
+	}
+	return client.NewReconnectableClientPool(c.Config, connectedFunc, c.Lazy, size)
+}
+
 func runClient(v *viper.Viper) {
 	if err := v.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
@@ -844,14 +869,16 @@ func runClient(v *viper.Viper) {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
 
+	if _, err := config.connectionPoolSize(); err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
 	if err := config.validateMimic(); err != nil {
 		logger.Fatal("failed to load client config", zap.Error(err))
 	}
 	mimicInst := config.startMimic()
 	defer mimicInst.Close()
 
-	c, err := client.NewReconnectableClient(
-		config.Config,
+	c, err := config.newClient(
 		func(c client.Client, info *client.HandshakeInfo, count int) {
 			connectLog(info, count)
 			// On the client side, we start checking for updates after we successfully connect
@@ -861,7 +888,7 @@ func runClient(v *viper.Viper) {
 			if count == 1 && !disableUpdateCheck {
 				go runCheckUpdateClient(c)
 			}
-		}, config.Lazy,
+		},
 	)
 	if err != nil {
 		logger.Fatal("failed to initialize client", zap.Error(err))

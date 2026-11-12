@@ -65,6 +65,7 @@ func TestClientConfig(t *testing.T) {
 			ECH:               "AEv+DQBHAAAgACB3rc0Q",
 		},
 		QUIC: clientConfigQUIC{
+			ConnectionPoolSize:          3,
 			InitStreamReceiveWindow:     1145141,
 			MaxStreamReceiveWindow:      1145142,
 			InitConnectionReceiveWindow: 1145143,

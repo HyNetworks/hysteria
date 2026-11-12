@@ -41,6 +41,7 @@ tls:
   ech: AEv+DQBHAAAgACB3rc0Q
 
 quic:
+  connectionPoolSize: 3
   initStreamReceiveWindow: 1145141
   maxStreamReceiveWindow: 1145142
   initConnReceiveWindow: 1145143
