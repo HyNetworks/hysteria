@@ -3,6 +3,7 @@ package tproxy
 import (
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/apernet/go-tproxy"
@@ -20,6 +21,20 @@ type UDPTProxy struct {
 	EventLogger UDPEventLogger
 }
 
+// udpPair is the hysteria session of one src/dst pair. Sends are serialized
+// because HyUDPConn.Send is not thread-safe, and both the pair's forwarding
+// goroutine and the listener (for packets that raced the pair's socket) send.
+type udpPair struct {
+	hyConn client.HyUDPConn
+	sendMu sync.Mutex
+}
+
+func (p *udpPair) send(data []byte, dst string) error {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	return p.hyConn.Send(data, dst)
+}
+
 type UDPEventLogger interface {
 	Connect(addr, reqAddr net.Addr)
 	Error(addr, reqAddr net.Addr, err error)
@@ -32,19 +47,28 @@ func (r *UDPTProxy) ListenAndServe(laddr *net.UDPAddr) error {
 	}
 	defer conn.Close()
 	buf := make([]byte, udpBufferSize)
+	var pairs sync.Map // src/dst key -> *udpPair
 	for {
-		// We will only get the first packet of each src/dst pair here,
+		// We will mostly get only the first packet of each src/dst pair here,
 		// because newPair will create a TProxy connection and take over
 		// the src/dst pair. Later packets will be sent there instead of here.
+		// Packets that arrive before that connection exists (e.g. a QUIC
+		// ClientHello split over two datagrams) still land here and must go
+		// through the existing pair, not a second hysteria session.
 		n, srcAddr, dstAddr, err := tproxy.ReadFromUDP(conn, buf)
 		if err != nil {
 			return err
 		}
-		r.newPair(srcAddr, dstAddr, buf[:n])
+		key := srcAddr.String() + " " + dstAddr.String()
+		if p, ok := pairs.Load(key); ok {
+			_ = p.(*udpPair).send(buf[:n], dstAddr.String())
+			continue
+		}
+		r.newPair(srcAddr, dstAddr, buf[:n], key, &pairs)
 	}
 }
 
-func (r *UDPTProxy) newPair(srcAddr, dstAddr *net.UDPAddr, initPkt []byte) {
+func (r *UDPTProxy) newPair(srcAddr, dstAddr *net.UDPAddr, initPkt []byte, key string, pairs *sync.Map) {
 	if r.EventLogger != nil {
 		r.EventLogger.Connect(srcAddr, dstAddr)
 	}
@@ -67,17 +91,20 @@ func (r *UDPTProxy) newPair(srcAddr, dstAddr *net.UDPAddr, initPkt []byte) {
 		closeErr = err
 		return
 	}
+	pair := &udpPair{hyConn: hyConn}
 	// Send the first packet
-	err = hyConn.Send(initPkt, dstAddr.String())
+	err = pair.send(initPkt, dstAddr.String())
 	if err != nil {
 		_ = conn.Close()
 		_ = hyConn.Close()
 		closeErr = err
 		return
 	}
+	pairs.Store(key, pair)
 	// Start forwarding
 	go func() {
-		err := r.forwarding(conn, hyConn, dstAddr.String())
+		err := r.forwarding(conn, pair, dstAddr.String())
+		pairs.CompareAndDelete(key, pair)
 		_ = conn.Close()
 		_ = hyConn.Close()
 		if r.EventLogger != nil {
@@ -91,12 +118,12 @@ func (r *UDPTProxy) newPair(srcAddr, dstAddr *net.UDPAddr, initPkt []byte) {
 	}()
 }
 
-func (r *UDPTProxy) forwarding(conn *net.UDPConn, hyConn client.HyUDPConn, dst string) error {
+func (r *UDPTProxy) forwarding(conn *net.UDPConn, pair *udpPair, dst string) error {
 	errChan := make(chan error, 2)
 	// Local <- Remote
 	go func() {
 		for {
-			bs, _, err := hyConn.Receive()
+			bs, _, err := pair.hyConn.Receive()
 			if err != nil {
 				errChan <- err
 				return
@@ -116,7 +143,7 @@ func (r *UDPTProxy) forwarding(conn *net.UDPConn, hyConn client.HyUDPConn, dst s
 			_ = r.updateConnDeadline(conn)
 			n, err := conn.Read(buf)
 			if n > 0 {
-				err := hyConn.Send(buf[:n], dst)
+				err := pair.send(buf[:n], dst)
 				if err != nil {
 					errChan <- err
 					return
