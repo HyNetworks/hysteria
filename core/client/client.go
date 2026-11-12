@@ -139,6 +139,7 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		return nil, coreErrs.ConnectError{Err: err}
 	}
 	if resp.StatusCode != protocol.StatusAuthOK {
+		_ = resp.Body.Close()
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		_ = tr.Close()
 		_ = pktConn.Close()
