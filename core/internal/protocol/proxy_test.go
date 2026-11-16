@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 func TestUDPMessage(t *testing.T) {
@@ -123,6 +124,69 @@ func TestUDPMessageMalformed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseUDPMessageReuseAddr(t *testing.T) {
+	serialize := func(addr string) []byte {
+		m := &UDPMessage{SessionID: 1, FragCount: 1, Addr: addr, Data: []byte("data")}
+		buf := make([]byte, MaxUDPSize)
+		return buf[:m.Serialize(buf)]
+	}
+
+	msg := serialize("example.com:443")
+	first, err := ParseUDPMessageReuseAddr(msg, "")
+	if err != nil {
+		t.Fatalf("ParseUDPMessageReuseAddr() error = %v", err)
+	}
+	if first.Addr != "example.com:443" {
+		t.Errorf("Addr = %q", first.Addr)
+	}
+	// Same address: lastAddr itself is returned
+	second, err := ParseUDPMessageReuseAddr(serialize("example.com:443"), first.Addr)
+	if err != nil {
+		t.Fatalf("ParseUDPMessageReuseAddr() error = %v", err)
+	}
+	if unsafe.StringData(second.Addr) != unsafe.StringData(first.Addr) {
+		t.Errorf("Addr should be the string passed in")
+	}
+	// Different address
+	third, err := ParseUDPMessageReuseAddr(serialize("example.org:443"), second.Addr)
+	if err != nil {
+		t.Fatalf("ParseUDPMessageReuseAddr() error = %v", err)
+	}
+	if third.Addr != "example.org:443" {
+		t.Errorf("Addr = %q", third.Addr)
+	}
+	// The address must not alias the message buffer
+	copy(msg, make([]byte, len(msg)))
+	if first.Addr != "example.com:443" {
+		t.Errorf("Addr refers to the message buffer")
+	}
+}
+
+func BenchmarkParseUDPMessage(b *testing.B) {
+	m := &UDPMessage{SessionID: 1, FragCount: 1, Addr: "203.0.113.1:53", Data: make([]byte, 1200)}
+	buf := make([]byte, MaxUDPSize)
+	msg := buf[:m.Serialize(buf)]
+	b.Run("new addr", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := ParseUDPMessage(msg); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("same addr", func(b *testing.B) {
+		b.ReportAllocs()
+		lastAddr := ""
+		for b.Loop() {
+			parsed, err := ParseUDPMessageReuseAddr(msg, lastAddr)
+			if err != nil {
+				b.Fatal(err)
+			}
+			lastAddr = parsed.Addr
+		}
+	})
 }
 
 func TestReadTCPRequest(t *testing.T) {

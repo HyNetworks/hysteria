@@ -1,0 +1,10 @@
+{
+  "version": "2.13.0",
+  "date": "2026-11-08",
+  "highlights": [
+    { "title": "QUIC sniffing, fixed", "desc": "Domain ACL rules now apply to browser QUIC" },
+    { "title": "sing-tun v0.9.6", "desc": "TUN mode moves to the latest upstream" },
+    { "title": "Chrome 154 parroting", "desc": "QUIC fingerprint matches current Chrome" },
+    { "title": "quic-go v0.63.0", "desc": "Plus the ECH log fix and cleanups" }
+  ]
+}

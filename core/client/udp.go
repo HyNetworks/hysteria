@@ -27,6 +27,7 @@ type udpConn struct {
 	D         *frag.Defragger
 	ReceiveCh chan *protocol.UDPMessage
 	SendBuf   []byte
+	SendMsg   protocol.UDPMessage
 	SendFunc  func([]byte, *protocol.UDPMessage) error
 	CloseFunc func()
 	Closed    bool
@@ -48,10 +49,11 @@ func (u *udpConn) Receive() ([]byte, string, error) {
 	}
 }
 
-// Send is not thread-safe, as it uses a shared SendBuf.
+// Send is not thread-safe, as it uses a shared SendBuf and SendMsg.
 func (u *udpConn) Send(data []byte, addr string) error {
 	// Try no frag first
-	msg := &protocol.UDPMessage{
+	msg := &u.SendMsg
+	*msg = protocol.UDPMessage{
 		SessionID: u.ID,
 		PacketID:  0,
 		FragID:    0,

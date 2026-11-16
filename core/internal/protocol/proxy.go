@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -191,34 +190,39 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 }
 
 func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
-	m := &UDPMessage{}
-	buf := bytes.NewBuffer(msg)
-	if err := binary.Read(buf, binary.BigEndian, &m.SessionID); err != nil {
-		return nil, err
+	return ParseUDPMessageReuseAddr(msg, "")
+}
+
+// ParseUDPMessageReuseAddr is like ParseUDPMessage, but uses lastAddr as the
+// address when the two are equal, instead of allocating a new string.
+func ParseUDPMessageReuseAddr(msg []byte, lastAddr string) (*UDPMessage, error) {
+	if len(msg) < 8 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	if err := binary.Read(buf, binary.BigEndian, &m.PacketID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragID); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(buf, binary.BigEndian, &m.FragCount); err != nil {
-		return nil, err
-	}
-	lAddr, err := quicvarint.Read(buf)
+	lAddr, n, err := quicvarint.Parse(msg[8:])
 	if err != nil {
 		return nil, err
 	}
 	if lAddr == 0 || lAddr > MaxMessageLength {
 		return nil, errors.ProtocolError{Message: "invalid address length"}
 	}
-	bs := buf.Bytes()
+	bs := msg[8+n:]
 	if len(bs) <= int(lAddr) {
 		// We use <= instead of < here as we expect at least one byte of data after the address
 		return nil, errors.ProtocolError{Message: "invalid message length"}
 	}
-	m.Addr = string(bs[:lAddr])
-	m.Data = bs[lAddr:]
+	m := &UDPMessage{
+		SessionID: binary.BigEndian.Uint32(msg),
+		PacketID:  binary.BigEndian.Uint16(msg[4:]),
+		FragID:    msg[6],
+		FragCount: msg[7],
+		Data:      bs[lAddr:],
+	}
+	if string(bs[:lAddr]) == lastAddr {
+		m.Addr = lastAddr
+	} else {
+		m.Addr = string(bs[:lAddr])
+	}
 	return m, nil
 }
 

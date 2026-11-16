@@ -213,6 +213,8 @@ func (e *udpSessionEntry) initConn(firstAddr, addr string) error {
 func (e *udpSessionEntry) receiveLoop() {
 	udpBuf := make([]byte, protocol.MaxUDPSize)
 	msgBuf := make([]byte, protocol.MaxUDPSize)
+	// Reused for every packet, SendMessage does not keep it
+	msg := &protocol.UDPMessage{}
 	for {
 		udpN, rAddr, err := e.conn.ReadFrom(udpBuf)
 		if err != nil {
@@ -228,7 +230,7 @@ func (e *udpSessionEntry) receiveLoop() {
 			rAddr = e.OriginalAddr
 		}
 
-		msg := &protocol.UDPMessage{
+		*msg = protocol.UDPMessage{
 			SessionID: e.ID,
 			PacketID:  0,
 			FragID:    0,

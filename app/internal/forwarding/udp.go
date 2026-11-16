@@ -2,6 +2,7 @@ package forwarding
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,8 +17,11 @@ const (
 	idleCleanupInterval = 1 * time.Second
 )
 
+var atomicTimeBase = time.Now()
+
+// atomicTime stores a time as an offset from atomicTimeBase, so that Set does not allocate.
 type atomicTime struct {
-	v atomic.Value
+	v atomic.Int64
 }
 
 func newAtomicTime(t time.Time) *atomicTime {
@@ -27,11 +31,27 @@ func newAtomicTime(t time.Time) *atomicTime {
 }
 
 func (t *atomicTime) Set(new time.Time) {
-	t.v.Store(new)
+	t.v.Store(int64(new.Sub(atomicTimeBase)))
 }
 
 func (t *atomicTime) Get() time.Time {
-	return t.v.Load().(time.Time)
+	return atomicTimeBase.Add(time.Duration(t.v.Load()))
+}
+
+// sessionKey avoids calling String() on a UDP address for every packet.
+type sessionKey struct {
+	AddrPort netip.AddrPort
+	String   string
+}
+
+func newSessionKey(addr net.Addr) sessionKey {
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		if addrPort := udpAddr.AddrPort(); addrPort.IsValid() {
+			// Both forms of an IPv4 address must give the same key
+			return sessionKey{AddrPort: netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port())}
+		}
+	}
+	return sessionKey{String: addr.String()}
 }
 
 type sessionEntry struct {
@@ -65,7 +85,7 @@ type UDPTunnel struct {
 	Timeout     time.Duration
 	EventLogger UDPEventLogger
 
-	m     map[string]*sessionEntry // addr -> HyConn
+	m     map[sessionKey]*sessionEntry // addr -> HyConn
 	mutex sync.RWMutex
 }
 
@@ -75,7 +95,7 @@ type UDPEventLogger interface {
 }
 
 func (t *UDPTunnel) Serve(pc net.PacketConn) error {
-	t.m = make(map[string]*sessionEntry)
+	t.m = make(map[sessionKey]*sessionEntry)
 
 	stopCh := make(chan struct{})
 	go t.idleCleanupLoop(stopCh)
@@ -127,8 +147,9 @@ func (t *UDPTunnel) cleanup(idleOnly bool) {
 }
 
 func (t *UDPTunnel) feed(pc net.PacketConn, addr net.Addr, data []byte) {
+	key := newSessionKey(addr)
 	t.mutex.RLock()
-	entry := t.m[addr.String()]
+	entry := t.m[key]
 	t.mutex.RUnlock()
 
 	// Create a new session if not exists
@@ -166,12 +187,12 @@ func (t *UDPTunnel) feed(pc net.PacketConn, addr net.Addr, data []byte) {
 			}
 			// Remove the session from the map
 			t.mutex.Lock()
-			delete(t.m, addr.String())
+			delete(t.m, key)
 			t.mutex.Unlock()
 		}()
 		// Insert the session into the map
 		t.mutex.Lock()
-		t.m[addr.String()] = entry
+		t.m[key] = entry
 		t.mutex.Unlock()
 	}
 

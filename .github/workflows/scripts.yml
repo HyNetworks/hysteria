@@ -6,6 +6,7 @@ on:
       - master
     paths:
       - scripts/**
+      - .github/workflows/scripts.yml
 
 jobs:
   publish:
@@ -19,11 +20,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Publish to Cloudflare Pages
-        uses: cloudflare/pages-action@v1
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: hy2scripts
-          directory: scripts
+          command: pages deploy scripts --project-name=hy2scripts --branch=main
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
-          branch: main

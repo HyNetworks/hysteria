@@ -7,8 +7,6 @@ import (
 	"strings"
 
 	"github.com/apernet/hysteria/extras/v2/outbounds/acl/v2geo"
-
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 type Protocol int
@@ -36,85 +34,23 @@ type Outbound interface {
 	any
 }
 
+// HostInfo is what host matchers match against.
 type HostInfo struct {
 	Name string
 	IPv4 net.IP
 	IPv6 net.IP
 }
 
-func (h HostInfo) String() string {
-	return fmt.Sprintf("%s|%s|%s", h.Name, h.IPv4, h.IPv6)
-}
-
-type CompiledRuleSet[O Outbound] interface {
-	Match(host HostInfo, proto Protocol, port uint16) (O, net.IP)
-}
-
-type compiledRule[O Outbound] struct {
-	Outbound      O
-	HostMatcher   hostMatcher
-	Protocol      Protocol
-	StartPort     uint16
-	EndPort       uint16
-	HijackAddress net.IP
-}
-
-func (r *compiledRule[O]) Match(host HostInfo, proto Protocol, port uint16) bool {
-	if r.Protocol != ProtocolBoth && r.Protocol != proto {
-		return false
-	}
-	if r.StartPort != 0 && (port < r.StartPort || port > r.EndPort) {
-		return false
-	}
-	return r.HostMatcher.Match(host)
-}
-
-type matchResult[O Outbound] struct {
-	Outbound      O
-	HijackAddress net.IP
-}
-
-type compiledRuleSetImpl[O Outbound] struct {
-	Rules []compiledRule[O]
-	Cache *lru.Cache[matchResultCacheKey, matchResult[O]] // key: HostInfo.String()
-}
-
-type matchResultCacheKey struct {
-	Host  string
-	Proto Protocol
-	Port  uint16
-}
-
-func (s *compiledRuleSetImpl[O]) Match(host HostInfo, proto Protocol, port uint16) (O, net.IP) {
-	host.Name = strings.TrimRight(strings.ToLower(host.Name), ".") // Normalize host name (lower case, no trailing dots)
-	key := matchResultCacheKey{
-		Host:  host.String(),
-		Proto: proto,
-		Port:  port,
-	}
-	if result, ok := s.Cache.Get(key); ok {
-		return result.Outbound, result.HijackAddress
-	}
-	for _, rule := range s.Rules {
-		if rule.Match(host, proto, port) {
-			result := matchResult[O]{rule.Outbound, rule.HijackAddress}
-			s.Cache.Add(key, result)
-			return result.Outbound, result.HijackAddress
-		}
-	}
-	// No match should also be cached
-	var zero O
-	s.Cache.Add(key, matchResult[O]{zero, nil})
-	return zero, nil
-}
-
+// CompilationError is returned when a rule fails to compile.
+// Source describes where the rule came from, e.g. "line 3" for a legacy
+// rule, or "rules[2]" for a rule from a list.
 type CompilationError struct {
-	LineNum int
+	Source  string
 	Message string
 }
 
 func (e *CompilationError) Error() string {
-	return fmt.Sprintf("error at line %d: %s", e.LineNum, e.Message)
+	return fmt.Sprintf("error at %s: %s", e.Source, e.Message)
 }
 
 type GeoLoader interface {
@@ -122,48 +58,19 @@ type GeoLoader interface {
 	LoadGeoSite() (map[string]*v2geo.GeoSite, error)
 }
 
-// Compile compiles TextRules into a CompiledRuleSet.
-// Names in the outbounds map MUST be in all lower case.
-// We want on-demand loading of GeoIP/GeoSite databases, so instead of passing the
-// databases directly, we use a GeoLoader interface to load them only when needed
-// by at least one rule.
-func Compile[O Outbound](rules []TextRule, outbounds map[string]O,
-	cacheSize int, geoLoader GeoLoader,
-) (CompiledRuleSet[O], error) {
-	compiledRules := make([]compiledRule[O], len(rules))
-	for i, rule := range rules {
-		outbound, ok := outbounds[strings.ToLower(rule.Outbound)]
-		if !ok {
-			return nil, &CompilationError{rule.LineNum, fmt.Sprintf("outbound %s not found", rule.Outbound)}
-		}
-		hm, errStr := compileHostMatcher(rule.Address, geoLoader)
-		if errStr != "" {
-			return nil, &CompilationError{rule.LineNum, errStr}
-		}
-		proto, startPort, endPort, ok := parseProtoPort(rule.ProtoPort)
-		if !ok {
-			return nil, &CompilationError{rule.LineNum, fmt.Sprintf("invalid protocol/port: %s", rule.ProtoPort)}
-		}
-		var hijackAddress net.IP
-		if rule.HijackAddress != "" {
-			hijackAddress = net.ParseIP(rule.HijackAddress)
-			if hijackAddress == nil {
-				return nil, &CompilationError{rule.LineNum, fmt.Sprintf("invalid hijack address (must be an IP address): %s", rule.HijackAddress)}
-			}
-		}
-		compiledRules[i] = compiledRule[O]{outbound, hm, proto, startPort, endPort, hijackAddress}
-	}
-	cache, err := lru.New[matchResultCacheKey, matchResult[O]](cacheSize)
-	if err != nil {
-		return nil, err
-	}
-	return &compiledRuleSetImpl[O]{compiledRules, cache}, nil
+// protoPort is the parsed form of a legacy proto/port field.
+type protoPort struct {
+	Proto     Protocol
+	HasPort   bool // false means any port
+	StartPort uint16
+	EndPort   uint16
 }
 
 // parseProtoPort parses the protocol and port from a protoPort string.
 // protoPort must be in one of the following formats:
 //
 //	proto/port
+//	proto/startPort-endPort
 //	proto/*
 //	proto
 //	*/port
@@ -172,122 +79,71 @@ func Compile[O Outbound](rules []TextRule, outbounds map[string]O,
 //	[empty] (same as *)
 //
 // proto must be either "tcp" or "udp", case-insensitive.
-func parseProtoPort(protoPort string) (Protocol, uint16, uint16, bool) {
-	protoPort = strings.ToLower(protoPort)
-	if protoPort == "" || protoPort == "*" || protoPort == "*/*" {
-		return ProtocolBoth, 0, 0, true
+func parseProtoPort(s string) (protoPort, bool) {
+	s = strings.ToLower(s)
+	if s == "" || s == "*" || s == "*/*" {
+		return protoPort{Proto: ProtocolBoth}, true
 	}
-	parts := strings.SplitN(protoPort, "/", 2)
-	if len(parts) == 1 {
-		// No port, only protocol
-		switch parts[0] {
-		case "tcp":
-			return ProtocolTCP, 0, 0, true
-		case "udp":
-			return ProtocolUDP, 0, 0, true
-		default:
-			return ProtocolBoth, 0, 0, false
+	parts := strings.SplitN(s, "/", 2)
+	var pp protoPort
+	switch parts[0] {
+	case "tcp":
+		pp.Proto = ProtocolTCP
+	case "udp":
+		pp.Proto = ProtocolUDP
+	case "*":
+		// A bare "*" is handled above, so there is always a port part here.
+		pp.Proto = ProtocolBoth
+	default:
+		return protoPort{}, false
+	}
+	if len(parts) == 1 || parts[1] == "*" {
+		return pp, true
+	}
+	// We allow either a single port or a range (e.g. "1000-2000")
+	ports := strings.SplitN(strings.TrimSpace(parts[1]), "-", 2)
+	if len(ports) == 1 {
+		p64, err := strconv.ParseUint(parts[1], 10, 16)
+		if err != nil {
+			return protoPort{}, false
 		}
+		pp.StartPort = uint16(p64)
+		pp.EndPort = pp.StartPort
 	} else {
-		// Both protocol and port
-		var proto Protocol
-		var startPort, endPort uint16
-		switch parts[0] {
-		case "tcp":
-			proto = ProtocolTCP
-		case "udp":
-			proto = ProtocolUDP
-		case "*":
-			proto = ProtocolBoth
-		default:
-			return ProtocolBoth, 0, 0, false
+		p64, err := strconv.ParseUint(ports[0], 10, 16)
+		if err != nil {
+			return protoPort{}, false
 		}
-		if parts[1] != "*" {
-			// We allow either a single port or a range (e.g. "1000-2000")
-			ports := strings.SplitN(strings.TrimSpace(parts[1]), "-", 2)
-			if len(ports) == 1 {
-				p64, err := strconv.ParseUint(parts[1], 10, 16)
-				if err != nil {
-					return ProtocolBoth, 0, 0, false
-				}
-				startPort = uint16(p64)
-				endPort = startPort
-			} else {
-				p64, err := strconv.ParseUint(ports[0], 10, 16)
-				if err != nil {
-					return ProtocolBoth, 0, 0, false
-				}
-				startPort = uint16(p64)
-				p64, err = strconv.ParseUint(ports[1], 10, 16)
-				if err != nil {
-					return ProtocolBoth, 0, 0, false
-				}
-				endPort = uint16(p64)
-				if startPort > endPort {
-					return ProtocolBoth, 0, 0, false
-				}
-			}
+		pp.StartPort = uint16(p64)
+		p64, err = strconv.ParseUint(ports[1], 10, 16)
+		if err != nil {
+			return protoPort{}, false
 		}
-		return proto, startPort, endPort, true
+		pp.EndPort = uint16(p64)
+		if pp.StartPort > pp.EndPort {
+			return protoPort{}, false
+		}
 	}
+	pp.HasPort = true
+	return pp, true
 }
 
+// compileHostMatcher compiles a legacy address field into a host matcher.
+// The returned string is an error message, empty on success.
 func compileHostMatcher(addr string, geoLoader GeoLoader) (hostMatcher, string) {
-	addr = strings.TrimRight(strings.ToLower(addr), ".") // Normalize host pattern (lower case, no trailing dots)
+	addr = normalizeHost(addr)
 	if addr == "*" || addr == "all" {
 		// Match all hosts
 		return &allMatcher{}, ""
 	}
 	if strings.HasPrefix(addr, "geoip:") {
-		// GeoIP matcher
-		country := addr[6:]
-		if len(country) == 0 {
-			return nil, "empty GeoIP country code"
-		}
-		gMap, err := geoLoader.LoadGeoIP()
-		if err != nil {
-			return nil, err.Error()
-		}
-		list, ok := gMap[country]
-		if !ok || list == nil {
-			return nil, fmt.Sprintf("GeoIP country code %s not found", country)
-		}
-		m, err := newGeoIPMatcher(list)
-		if err != nil {
-			return nil, err.Error()
-		}
-		return m, ""
+		return compileGeoIPMatcher(addr[6:], geoLoader)
 	}
 	if strings.HasPrefix(addr, "geosite:") {
-		// GeoSite matcher
-		name, attrs := parseGeoSiteName(addr[8:])
-		if len(name) == 0 {
-			return nil, "empty GeoSite name"
-		}
-		gMap, err := geoLoader.LoadGeoSite()
-		if err != nil {
-			return nil, err.Error()
-		}
-		list, ok := gMap[name]
-		if !ok || list == nil {
-			return nil, fmt.Sprintf("GeoSite name %s not found", name)
-		}
-		m, err := newGeositeMatcher(list, attrs)
-		if err != nil {
-			return nil, err.Error()
-		}
-		return m, ""
+		return compileGeoSiteMatcher(addr[8:], geoLoader)
 	}
 	if strings.HasPrefix(addr, "suffix:") {
-		// Domain suffix matcher
-		suffix := addr[7:]
-		if len(suffix) == 0 {
-			return nil, "empty domain suffix"
-		}
-		return &domainMatcher{
-			Pattern: suffix,
-			Mode:    domainMatchSuffix,
-		}, ""
+		return compileSuffixMatcher(addr[7:])
 	}
 	if strings.Contains(addr, "/") {
 		// CIDR matcher
@@ -301,18 +157,83 @@ func compileHostMatcher(addr string, geoLoader GeoLoader) (hostMatcher, string) 
 		// Single IP matcher
 		return &ipMatcher{ip}, ""
 	}
-	if strings.Contains(addr, "*") {
-		// Wildcard domain matcher
+	return compileDomainMatcher(addr), ""
+}
+
+// compileDomainMatcher compiles an exact or wildcard domain pattern.
+// The pattern must already be normalized.
+func compileDomainMatcher(pattern string) hostMatcher {
+	if strings.Contains(pattern, "*") {
 		return &domainMatcher{
-			Pattern: addr,
+			Pattern: pattern,
 			Mode:    domainMatchWildcard,
-		}, ""
+		}
 	}
-	// Nothing else matched, treat it as a non-wildcard domain
 	return &domainMatcher{
-		Pattern: addr,
+		Pattern: pattern,
 		Mode:    domainMatchExact,
+	}
+}
+
+// compileSuffixMatcher compiles a domain suffix pattern.
+// The pattern must already be normalized.
+func compileSuffixMatcher(suffix string) (hostMatcher, string) {
+	if len(suffix) == 0 {
+		return nil, "empty domain suffix"
+	}
+	return &domainMatcher{
+		Pattern: suffix,
+		Mode:    domainMatchSuffix,
 	}, ""
+}
+
+// compileGeoIPMatcher compiles a GeoIP country code.
+// The code must already be normalized.
+func compileGeoIPMatcher(country string, geoLoader GeoLoader) (hostMatcher, string) {
+	if len(country) == 0 {
+		return nil, "empty GeoIP country code"
+	}
+	if geoLoader == nil {
+		return nil, "GeoIP database not available"
+	}
+	gMap, err := geoLoader.LoadGeoIP()
+	if err != nil {
+		return nil, err.Error()
+	}
+	list, ok := gMap[country]
+	if !ok || list == nil {
+		return nil, fmt.Sprintf("GeoIP country code %s not found", country)
+	}
+	m, err := newGeoIPMatcher(list)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return m, ""
+}
+
+// compileGeoSiteMatcher compiles a GeoSite name with optional @attributes.
+// The name must already be normalized.
+func compileGeoSiteMatcher(s string, geoLoader GeoLoader) (hostMatcher, string) {
+	name, attrs := parseGeoSiteName(s)
+	if len(name) == 0 {
+		return nil, "empty GeoSite name"
+	}
+	if geoLoader == nil {
+		return nil, "GeoSite database not available"
+	}
+	gMap, err := geoLoader.LoadGeoSite()
+	if err != nil {
+		return nil, err.Error()
+	}
+	list, ok := gMap[name]
+	if !ok || list == nil {
+		return nil, fmt.Sprintf("GeoSite name %s not found", name)
+	}
+	m, err := newGeositeMatcher(list, attrs)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return m, ""
 }
 
 func parseGeoSiteName(s string) (string, []string) {

@@ -3,7 +3,9 @@ package outbounds
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -293,45 +295,87 @@ type directOutboundUDPConn struct {
 	*directOutbound
 	*net.UDPConn
 	State udpConnState
+
+	// The last address converted in each direction, as it rarely changes between packets
+	lastRead  atomic.Pointer[directOutboundUDPRead]
+	lastWrite atomic.Pointer[directOutboundUDPWrite]
+}
+
+type directOutboundUDPRead struct {
+	AddrPort netip.AddrPort
+	Host     string
+}
+
+type directOutboundUDPWrite struct {
+	Host     string
+	Port     uint16
+	AddrPort netip.AddrPort
 }
 
 func (u *directOutboundUDPConn) ReadFrom(b []byte) (int, *AddrEx, error) {
-	n, addr, err := u.UDPConn.ReadFromUDP(b)
-	if addr != nil {
-		return n, &AddrEx{
-			Host: addr.IP.String(),
-			Port: uint16(addr.Port),
-		}, err
-	} else {
+	n, addrPort, err := u.UDPConn.ReadFromUDPAddrPort(b)
+	if !addrPort.IsValid() {
 		return n, nil, err
 	}
+	last := u.lastRead.Load()
+	if last == nil || last.AddrPort != addrPort {
+		last = &directOutboundUDPRead{
+			AddrPort: addrPort,
+			// Same string as net.IP.String()
+			Host: addrPort.Addr().Unmap().WithZone("").String(),
+		}
+		u.lastRead.Store(last)
+	}
+	return n, &AddrEx{
+		Host: last.Host,
+		Port: addrPort.Port(),
+	}, err
 }
 
 func (u *directOutboundUDPConn) WriteTo(b []byte, addr *AddrEx) (int, error) {
+	// Only IP literals are cached, host names are resolved every time
+	isLiteral := false
 	if addr.ResolveInfo == nil {
-		u.directOutbound.resolve(addr)
+		last := u.lastWrite.Load()
+		if last != nil && last.Host == addr.Host && last.Port == addr.Port {
+			return u.UDPConn.WriteToUDPAddrPort(b, last.AddrPort)
+		}
+		isLiteral = tryParseIP(addr)
+		if !isLiteral {
+			u.directOutbound.resolve(addr)
+		}
 	}
-	r := addr.ResolveInfo
+	ip, err := u.selectIP(addr.ResolveInfo)
+	if err != nil {
+		return 0, err
+	}
+	addrPort := netip.AddrPortFrom(ipToNetipAddr(ip), addr.Port)
+	if isLiteral {
+		u.lastWrite.Store(&directOutboundUDPWrite{
+			Host:     addr.Host,
+			Port:     addr.Port,
+			AddrPort: addrPort,
+		})
+	}
+	return u.UDPConn.WriteToUDPAddrPort(b, addrPort)
+}
+
+// selectIP picks the resolved IP to send to, based on the socket's address family and the outbound mode.
+func (u *directOutboundUDPConn) selectIP(r *ResolveInfo) (net.IP, error) {
 	if r.IPv4 == nil && r.IPv6 == nil {
-		return 0, resolveError{Err: r.Err}
+		return nil, resolveError{Err: r.Err}
 	}
 	if u.State == udpConnStateIPv4 {
 		if r.IPv4 != nil {
-			return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-				IP:   r.IPv4,
-				Port: int(addr.Port),
-			})
+			return r.IPv4, nil
 		} else {
-			return 0, noAddressError{IPv4: true}
+			return nil, noAddressError{IPv4: true}
 		}
 	} else if u.State == udpConnStateIPv6 {
 		if r.IPv6 != nil {
-			return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-				IP:   r.IPv6,
-				Port: int(addr.Port),
-			})
+			return r.IPv6, nil
 		} else {
-			return 0, noAddressError{IPv6: true}
+			return nil, noAddressError{IPv6: true}
 		}
 	} else {
 		// Dual stack
@@ -340,62 +384,46 @@ func (u *directOutboundUDPConn) WriteTo(b []byte, addr *AddrEx) (int, error) {
 			// This is a special case.
 			// We must make a decision here, so we prefer IPv4 for maximum compatibility.
 			if r.IPv4 != nil {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv4,
-					Port: int(addr.Port),
-				})
+				return r.IPv4, nil
 			} else {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv6,
-					Port: int(addr.Port),
-				})
+				return r.IPv6, nil
 			}
 		case DirectOutboundMode64:
 			if r.IPv6 != nil {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv6,
-					Port: int(addr.Port),
-				})
+				return r.IPv6, nil
 			} else {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv4,
-					Port: int(addr.Port),
-				})
+				return r.IPv4, nil
 			}
 		case DirectOutboundMode46:
 			if r.IPv4 != nil {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv4,
-					Port: int(addr.Port),
-				})
+				return r.IPv4, nil
 			} else {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv6,
-					Port: int(addr.Port),
-				})
+				return r.IPv6, nil
 			}
 		case DirectOutboundMode6:
 			if r.IPv6 != nil {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv6,
-					Port: int(addr.Port),
-				})
+				return r.IPv6, nil
 			} else {
-				return 0, noAddressError{IPv6: true}
+				return nil, noAddressError{IPv6: true}
 			}
 		case DirectOutboundMode4:
 			if r.IPv4 != nil {
-				return u.UDPConn.WriteToUDP(b, &net.UDPAddr{
-					IP:   r.IPv4,
-					Port: int(addr.Port),
-				})
+				return r.IPv4, nil
 			} else {
-				return 0, noAddressError{IPv4: true}
+				return nil, noAddressError{IPv4: true}
 			}
 		default:
-			return 0, invalidOutboundModeError{}
+			return nil, invalidOutboundModeError{}
 		}
 	}
+}
+
+func ipToNetipAddr(ip net.IP) netip.Addr {
+	if ip4 := ip.To4(); ip4 != nil {
+		return netip.AddrFrom4([4]byte(ip4))
+	}
+	addr, _ := netip.AddrFromSlice(ip)
+	return addr
 }
 
 func (u *directOutboundUDPConn) Close() error {

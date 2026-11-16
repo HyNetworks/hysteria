@@ -59,7 +59,7 @@ func TestClientServerTCPClose(t *testing.T) {
 		sobConnChCloseFunc()
 		return nil
 	})
-	serverOb.EXPECT().TCP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().TCP(mock.Anything, addr).Return(sobConn, nil).Once()
 	conn, err := c.TCP(addr)
 	assert.NoError(t, err)
 	_, err = conn.Write([]byte("happy"))
@@ -84,7 +84,7 @@ func TestClientServerTCPClose(t *testing.T) {
 		}
 	})
 	sobConn.EXPECT().Close().Return(nil)
-	serverOb.EXPECT().TCP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().TCP(mock.Anything, addr).Return(sobConn, nil).Once()
 	conn, err = c.TCP(addr)
 	assert.NoError(t, err)
 	sobConnCh2 <- []byte("happy")
@@ -145,7 +145,7 @@ func TestClientServerUDPIdleTimeout(t *testing.T) {
 		}
 	})
 	sobConn.EXPECT().WriteTo([]byte("happy"), addr).Return(5, nil).Times(4)
-	serverOb.EXPECT().UDP(addr).Return(sobConn, nil).Once()
+	serverOb.EXPECT().UDP(mock.Anything, addr).Return(sobConn, nil).Once()
 	eventLogger.EXPECT().UDPRequest(mock.Anything, mock.Anything, uint32(1), addr).Once()
 	cu, err := c.UDP()
 	assert.NoError(t, err)

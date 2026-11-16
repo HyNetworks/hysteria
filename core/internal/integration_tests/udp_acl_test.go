@@ -21,11 +21,11 @@ type gatedOutbound struct {
 	dialedAddrs atomic.Int32
 }
 
-func (o *gatedOutbound) TCP(reqAddr string) (net.Conn, error) {
+func (o *gatedOutbound) TCP(info *server.RequestInfo, reqAddr string) (net.Conn, error) {
 	return net.Dial("tcp", reqAddr)
 }
 
-func (o *gatedOutbound) UDP(reqAddr string) (server.UDPConn, error) {
+func (o *gatedOutbound) UDP(info *server.RequestInfo, reqAddr string) (server.UDPConn, error) {
 	if reqAddr == o.blocked {
 		return nil, errors.New("rejected")
 	}
@@ -37,7 +37,7 @@ func (o *gatedOutbound) UDP(reqAddr string) (server.UDPConn, error) {
 	return &gatedUDPConn{UDPConn: c}, nil
 }
 
-func (o *gatedOutbound) CheckUDP(reqAddr string) error {
+func (o *gatedOutbound) CheckUDP(info *server.RequestInfo, reqAddr string) error {
 	o.checkCalls.Add(1)
 	if reqAddr == o.blocked {
 		return errors.New("rejected")

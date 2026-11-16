@@ -313,6 +313,8 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 
 type udpIOImpl struct {
 	Conn *quic.Conn
+
+	lastAddr string // Address of the last message received
 }
 
 func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
@@ -322,11 +324,12 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 			// Connection error, this will stop the session manager
 			return nil, err
 		}
-		udpMsg, err := protocol.ParseUDPMessage(msg)
+		udpMsg, err := protocol.ParseUDPMessageReuseAddr(msg, io.lastAddr)
 		if err != nil {
 			// Invalid message, this is fine - just wait for the next
 			continue
 		}
+		io.lastAddr = udpMsg.Addr
 		return udpMsg, nil
 	}
 }

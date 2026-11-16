@@ -166,6 +166,13 @@ func TestServerConfig(t *testing.T) {
 				"lmao(ok)",
 				"kek(cringe,boba,tea)",
 			},
+			Rules: []serverConfigACLRule{
+				{Outbound: "alice_exit", Match: `auth.id == "alice"`},
+				{Outbound: "default", Match: "dst.port == 53", Hijack: "1.1.1.1"},
+				{Legacy: "reject(geoip:cn)"},
+				{LegacyFile: "legacy_acl.txt"},
+			},
+			RulesFile:         "acl_rules.yaml",
 			GeoIP:             "some.dat",
 			GeoSite:           "some_site.dat",
 			GeoUpdateInterval: 168 * time.Hour,
