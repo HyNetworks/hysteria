@@ -280,8 +280,9 @@ type serverConfigOutboundEntry struct {
 }
 
 type serverConfigTrafficStats struct {
-	Listen string `mapstructure:"listen"`
-	Secret string `mapstructure:"secret"`
+	Listen             string `mapstructure:"listen"`
+	Secret             string `mapstructure:"secret"`
+	DisableDumpStreams bool   `mapstructure:"disableDumpStreams"`
 }
 
 type serverConfigMasqueradeFile struct {
@@ -1513,7 +1514,7 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
-		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret, c.TrafficStats.DisableDumpStreams)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}
