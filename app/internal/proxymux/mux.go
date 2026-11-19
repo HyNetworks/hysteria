@@ -6,7 +6,12 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
+
+// sniffTimeout bounds how long we wait for the first byte that tells HTTP from
+// SOCKS5 apart.
+const sniffTimeout = 10 * time.Second
 
 func newMuxListener(listener net.Listener, deleteFunc func()) *muxListener {
 	l := &muxListener{
@@ -116,11 +121,15 @@ func (l *muxListener) mainLoop() {
 }
 
 func (l *muxListener) dispatch(conn net.Conn) {
+	// Bound the protocol sniff. A client that connects and sends nothing would
+	// otherwise hold this goroutine and its file descriptor forever.
+	_ = conn.SetReadDeadline(time.Now().Add(sniffTimeout))
 	var b [1]byte
 	if _, err := io.ReadFull(conn, b[:]); err != nil {
 		conn.Close()
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 
 	l.lock.Lock()
 	var target *subListener

@@ -81,6 +81,7 @@ socks5:
   username: anon
   password: bro
   disableUDP: true
+  timeout: 30s
 
 http:
   listen: 127.0.0.1:8080
