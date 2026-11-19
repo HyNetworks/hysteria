@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-var linePattern = regexp.MustCompile(`^(\w+)\s*\(([^,]+)(?:,([^,]+))?(?:,([^,]+))?\)$`)
+var linePattern = regexp.MustCompile(`^([\w-]+)\s*\(([^,]+)(?:,([^,]+))?(?:,([^,]+))?\)$`)
 
 type InvalidSyntaxError struct {
 	Line    string
