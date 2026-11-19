@@ -244,19 +244,16 @@ func (c *clientImpl) Close() error {
 	return nil
 }
 
-var nonPermanentErrors = []error{
-	quic.StreamLimitReachedError{},
-}
-
 // wrapIfConnectionClosed checks if the error returned by quic-go
-// is recoverable (listed in nonPermanentErrors) or permanent.
+// is recoverable (stream limit reached) or permanent.
 // Recoverable errors are returned as-is,
 // permanent ones are wrapped as ClosedError.
 func wrapIfConnectionClosed(err error) error {
-	for _, e := range nonPermanentErrors {
-		if errors.Is(err, e) {
-			return err
-		}
+	// quic-go returns *StreamLimitReachedError, which errors.Is
+	// does not match against a StreamLimitReachedError{} value.
+	var streamLimitErr *quic.StreamLimitReachedError
+	if errors.As(err, &streamLimitErr) || errors.Is(err, quic.StreamLimitReachedError{}) {
+		return err
 	}
 	return coreErrs.ClosedError{Err: err}
 }
