@@ -15,6 +15,27 @@ import (
 
 //go:generate mockery
 
+func TestSubListenerConcurrentClose(t *testing.T) {
+	l := newSubListener(func() error { return nil }, func() net.Addr { return nil })
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			assert.NoError(t, l.Close())
+		}()
+	}
+	close(start)
+	wg.Wait()
+	select {
+	case <-l.closeChan:
+	default:
+		t.Fatal("sublistener was not closed")
+	}
+}
+
 func testMockListener(t *testing.T, connChan <-chan net.Conn) net.Listener {
 	closedChan := make(chan struct{})
 	mockListener := mocks.NewMockListener(t)
