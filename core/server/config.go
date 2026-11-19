@@ -22,6 +22,7 @@ const (
 	defaultMaxIdleTimeout      = 30 * time.Second
 	defaultMaxIncomingStreams  = 1024
 	defaultUDPIdleTimeout      = 60 * time.Second
+	defaultTCPStallTimeout     = 10 * time.Second
 )
 
 type Config struct {
@@ -37,10 +38,16 @@ type Config struct {
 	IgnoreClientBandwidth bool
 	DisableUDP            bool
 	UDPIdleTimeout        time.Duration
-	Authenticator         Authenticator
-	EventLogger           EventLogger
-	TrafficLogger         TrafficLogger
-	MasqHandler           http.Handler
+	// TCPStallTimeout closes a TCP request whose target accepts no data for
+	// this long (a single write makes no progress). Such a target otherwise
+	// pins the stream's unread data in the connection-level flow-control
+	// window and can stall every other stream of the client. 0 means the
+	// default (10s), a negative value disables the check.
+	TCPStallTimeout time.Duration
+	Authenticator   Authenticator
+	EventLogger     EventLogger
+	TrafficLogger   TrafficLogger
+	MasqHandler     http.Handler
 }
 
 // fill fills the fields that are not set by the user with default values when possible,
@@ -102,6 +109,11 @@ func (c *Config) fill() error {
 	}
 	if c.BandwidthConfig.MaxRx != 0 && c.BandwidthConfig.MaxRx < 65536 {
 		return errors.ConfigError{Field: "BandwidthConfig.MaxRx", Reason: "must be at least 65536"}
+	}
+	if c.TCPStallTimeout == 0 {
+		c.TCPStallTimeout = defaultTCPStallTimeout
+	} else if c.TCPStallTimeout > 0 && c.TCPStallTimeout < time.Second {
+		return errors.ConfigError{Field: "TCPStallTimeout", Reason: "must be at least 1s (or negative to disable)"}
 	}
 	if c.UDPIdleTimeout == 0 {
 		c.UDPIdleTimeout = defaultUDPIdleTimeout
