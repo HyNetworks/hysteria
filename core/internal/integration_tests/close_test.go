@@ -2,6 +2,7 @@ package integration_tests
 
 import (
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -92,6 +93,58 @@ func TestClientServerTCPClose(t *testing.T) {
 	bs, err := io.ReadAll(conn)
 	assert.NoError(t, err)
 	assert.Equal(t, "happy", string(bs))
+}
+
+// TestClientServerTCPResponseTimeout tests whether the client gives up waiting for
+// the TCP response when the server accepts the stream but never answers it.
+func TestClientServerTCPResponseTimeout(t *testing.T) {
+	// Create server
+	udpConn, udpAddr, err := serverConn()
+	assert.NoError(t, err)
+	serverOb := mocks.NewMockOutbound(t)
+	auth := mocks.NewMockAuthenticator(t)
+	auth.EXPECT().Authenticate(mock.Anything, mock.Anything, mock.Anything).Return(true, "nobody")
+	s, err := server.NewServer(&server.Config{
+		TLSConfig:     serverTLSConfig(),
+		Conn:          udpConn,
+		Outbound:      serverOb,
+		Authenticator: auth,
+	})
+	assert.NoError(t, err)
+	defer s.Close()
+	go s.Serve()
+
+	// The server outbound never returns, so the server never writes a TCP response.
+	blockCh := make(chan struct{})
+	defer close(blockCh)
+	serverOb.EXPECT().TCP(mock.Anything).RunAndReturn(func(string) (net.Conn, error) {
+		<-blockCh
+		return nil, io.EOF
+	}).Once()
+
+	// Create client
+	c, _, err := client.NewClient(&client.Config{
+		ServerAddr: udpAddr,
+		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
+	})
+	assert.NoError(t, err)
+	defer c.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := c.TCP("never.answers:443")
+		if conn != nil {
+			_ = conn.Close()
+		}
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		var closedErr errors.ClosedError
+		assert.ErrorAs(t, err, &closedErr)
+	case <-time.After(60 * time.Second):
+		t.Fatal("client TCP() still blocked waiting for the server response")
+	}
 }
 
 // TestClientServerUDPIdleTimeout tests whether the server's UDP idle timeout works correctly.
