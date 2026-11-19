@@ -13,9 +13,15 @@ func FragUDPMessage(m *protocol.UDPMessage, maxSize int) []protocol.UDPMessage {
 	if maxPayloadSize <= 0 {
 		return nil
 	}
+	// UDPMessage.FragCount is a uint8 on the wire, so a message cannot be
+	// split into more than 255 fragments. Compute the count with an int first
+	// to avoid uint8 overflow producing a short (or empty) slice.
+	fragCount := (len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize // round up
+	if fragCount > 255 {
+		return nil
+	}
 	off := 0
 	fragID := uint8(0)
-	fragCount := uint8((len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize) // round up
 	frags := make([]protocol.UDPMessage, fragCount)
 	for off < len(fullPayload) {
 		payloadSize := len(fullPayload) - off
@@ -24,7 +30,7 @@ func FragUDPMessage(m *protocol.UDPMessage, maxSize int) []protocol.UDPMessage {
 		}
 		frag := *m
 		frag.FragID = fragID
-		frag.FragCount = fragCount
+		frag.FragCount = uint8(fragCount)
 		frag.Data = fullPayload[off : off+payloadSize]
 		frags[fragID] = frag
 		off += payloadSize

@@ -334,3 +334,43 @@ func TestDefragger(t *testing.T) {
 		})
 	}
 }
+
+func TestFragUDPMessage_FragmentCountLimit(t *testing.T) {
+	// UDPMessage.FragCount is a uint8 on the wire, so a message can never be
+	// split into more than 255 fragments. FragUDPMessage must respect that
+	// limit instead of wrapping the count and indexing past the slice.
+	const maxPayloadSize = 16
+	m := &protocol.UDPMessage{SessionID: 1, Addr: "a"}
+	maxSize := m.HeaderSize() + maxPayloadSize
+
+	t.Run("255 fragments", func(t *testing.T) {
+		m.Data = make([]byte, maxPayloadSize*255)
+		got := FragUDPMessage(m, maxSize)
+		if len(got) != 255 {
+			t.Fatalf("got %d fragments, want 255", len(got))
+		}
+		var data []byte
+		for i, f := range got {
+			if f.FragID != uint8(i) || f.FragCount != 255 {
+				t.Fatalf("fragment %d: FragID=%d FragCount=%d", i, f.FragID, f.FragCount)
+			}
+			data = append(data, f.Data...)
+		}
+		if !reflect.DeepEqual(data, m.Data) {
+			t.Error("reassembled data does not match the original")
+		}
+	})
+
+	t.Run("256 fragments", func(t *testing.T) {
+		m.Data = make([]byte, maxPayloadSize*256)
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("FragUDPMessage panicked on >255 fragments: %v", r)
+			}
+		}()
+		got := FragUDPMessage(m, maxSize)
+		if got != nil {
+			t.Errorf("got %d fragments, want nil (exceeds uint8 FragCount)", len(got))
+		}
+	})
+}
