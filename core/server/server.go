@@ -244,12 +244,25 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// frameTypeHeaders is the HTTP/3 HEADERS frame type (RFC 9114, section 7.2.2).
+const frameTypeHeaders http3.FrameType = 0x1
+
+var errUnexpectedStream = errors.New("unexpected stream from authenticated client")
+
 func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.authenticated {
+	if err != nil {
+		return false, nil
+	}
+	h.authMutex.Lock()
+	authenticated := h.authenticated
+	h.authMutex.Unlock()
+	if !authenticated {
 		return false, nil
 	}
 
 	switch ft {
+	case frameTypeHeaders:
+		return false, nil
 	case protocol.FrameTypeTCPRequest:
 		// StreamDispatcher only peeks the frame type. Consume it so ReadTCPRequest
 		// starts at address length, matching pre-upgrade StreamHijacker behavior.
@@ -261,7 +274,9 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, stream *quic.Stream
 		go h.handleTCPRequest(qStream)
 		return true, nil
 	default:
-		return false, nil
+		// HTTP/3 would close the whole connection with H3_FRAME_UNEXPECTED,
+		// dropping every other stream. Reset only this one.
+		return false, errUnexpectedStream
 	}
 }
 
