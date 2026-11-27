@@ -60,6 +60,24 @@ func TestCloseUnblocksTimeoutDeliveryToFullQueue(t *testing.T) {
 	}
 	u.recvQueue <- &udpPacket{}
 	done := make(chan struct{})
+	t.Cleanup(func() {
+		_ = u.Close()
+		select {
+		case <-done:
+			return
+		default:
+		}
+		// Drain the queued packet so cleanup can release a blocked receiver.
+		select {
+		case <-u.recvQueue:
+		default:
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("receive loop did not stop during cleanup")
+		}
+	})
 	go func() {
 		u.recvLoop(conn)
 		close(done)
@@ -73,9 +91,6 @@ func TestCloseUnblocksTimeoutDeliveryToFullQueue(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		// Drain the queued packet so the test does not leave a blocked receiver.
-		<-u.recvQueue
-		<-done
 		t.Fatal("receive loop remained blocked on timeout delivery after Close")
 	}
 }
