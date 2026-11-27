@@ -31,6 +31,70 @@ type readResult struct {
 	err  error
 }
 
+type observedPacketConn struct {
+	*stubPacketConn
+	read chan struct{}
+}
+
+func (c *observedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.stubPacketConn.ReadFrom(p)
+	select {
+	case c.read <- struct{}{}:
+	default:
+	}
+	return n, addr, err
+}
+
+func TestCloseUnblocksTimeoutDeliveryToFullQueue(t *testing.T) {
+	conn := &observedPacketConn{
+		stubPacketConn: &stubPacketConn{readResults: []readResult{{err: timeoutError{}}}},
+		read:           make(chan struct{}, 1),
+	}
+	u := &udpHopPacketConn{
+		currentConn: conn,
+		recvQueue:   make(chan *udpPacket, 1),
+		closeChan:   make(chan struct{}),
+		bufPool: sync.Pool{New: func() interface{} {
+			return make([]byte, udpBufferSize)
+		}},
+	}
+	u.recvQueue <- &udpPacket{}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		_ = u.Close()
+		select {
+		case <-done:
+			return
+		default:
+		}
+		// Drain the queued packet so cleanup can release a blocked receiver.
+		select {
+		case <-u.recvQueue:
+		default:
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("receive loop did not stop during cleanup")
+		}
+	})
+	go func() {
+		u.recvLoop(conn)
+		close(done)
+	}()
+	select {
+	case <-conn.read:
+	case <-time.After(time.Second):
+		t.Fatal("receive loop did not read the timeout")
+	}
+	require.NoError(t, u.Close())
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("receive loop remained blocked on timeout delivery after Close")
+	}
+}
+
 func (c *stubPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
