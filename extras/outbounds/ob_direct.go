@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -45,6 +46,10 @@ type directOutbound struct {
 	DeviceName string
 	BindIP4    net.IP
 	BindIP6    net.IP
+
+	// LookupIPFunc overrides the built-in DNS resolver used by resolve.
+	// When nil, net.LookupIP is used.
+	LookupIPFunc func(host string) ([]net.IP, error)
 }
 
 type DirectOutboundOptions struct {
@@ -184,7 +189,11 @@ func NewDirectOutboundBindToDevice(mode DirectOutboundMode, deviceName string) (
 // resolve is our built-in DNS resolver for handling the case when
 // AddrEx.ResolveInfo is nil.
 func (d *directOutbound) resolve(reqAddr *AddrEx) {
-	ips, err := net.LookupIP(reqAddr.Host)
+	lookupIP := net.LookupIP
+	if d.LookupIPFunc != nil {
+		lookupIP = d.LookupIPFunc
+	}
+	ips, err := lookupIP(reqAddr.Host)
 	if err != nil {
 		reqAddr.ResolveInfo = &ResolveInfo{Err: err}
 		return
@@ -299,6 +308,8 @@ type directOutboundUDPConn struct {
 	// The last address converted in each direction, as it rarely changes between packets
 	lastRead  atomic.Pointer[directOutboundUDPRead]
 	lastWrite atomic.Pointer[directOutboundUDPWrite]
+	// Serializes the slow path so concurrent first packets of a flow resolve once.
+	writeMu sync.Mutex
 }
 
 type directOutboundUDPRead struct {
@@ -333,31 +344,53 @@ func (u *directOutboundUDPConn) ReadFrom(b []byte) (int, *AddrEx, error) {
 }
 
 func (u *directOutboundUDPConn) WriteTo(b []byte, addr *AddrEx) (int, error) {
-	// Only IP literals are cached, host names are resolved every time
-	isLiteral := false
+	// Resolve hostnames once per session and reuse the address for every packet
+	// of the flow. Otherwise a rotating DNS answer can spread a single QUIC
+	// flow across several server IPs. A caller-provided ResolveInfo is honored
+	// as-is and never overwritten by the cache.
 	if addr.ResolveInfo == nil {
 		last := u.lastWrite.Load()
 		if last != nil && last.Host == addr.Host && last.Port == addr.Port {
 			return u.UDPConn.WriteToUDPAddrPort(b, last.AddrPort)
 		}
-		isLiteral = tryParseIP(addr)
-		if !isLiteral {
-			u.directOutbound.resolve(addr)
+		u.writeMu.Lock()
+		last = u.lastWrite.Load()
+		if last == nil || last.Host != addr.Host || last.Port != addr.Port {
+			if !tryParseIP(addr) {
+				u.directOutbound.resolve(addr)
+			}
+			u.cacheWriteAddr(addr)
+			last = u.lastWrite.Load()
+		}
+		u.writeMu.Unlock()
+		if last != nil && last.Host == addr.Host && last.Port == addr.Port {
+			return u.UDPConn.WriteToUDPAddrPort(b, last.AddrPort)
 		}
 	}
 	ip, err := u.selectIP(addr.ResolveInfo)
 	if err != nil {
 		return 0, err
 	}
-	addrPort := netip.AddrPortFrom(ipToNetipAddr(ip), addr.Port)
-	if isLiteral {
-		u.lastWrite.Store(&directOutboundUDPWrite{
-			Host:     addr.Host,
-			Port:     addr.Port,
-			AddrPort: addrPort,
-		})
+	return u.UDPConn.WriteToUDPAddrPort(b, netip.AddrPortFrom(ipToNetipAddr(ip), addr.Port))
+}
+
+// cacheWriteAddr seeds the per-session write cache from a ResolveInfo that a
+// resolver stage already produced when the UDP session was created. Without
+// it, the first packet would be re-resolved with the built-in resolver and the
+// configured resolver's answer would be discarded.
+func (u *directOutboundUDPConn) cacheWriteAddr(addr *AddrEx) {
+	if addr.ResolveInfo == nil {
+		return
 	}
-	return u.UDPConn.WriteToUDPAddrPort(b, addrPort)
+	ip, err := u.selectIP(addr.ResolveInfo)
+	if err != nil {
+		return
+	}
+	u.lastWrite.Store(&directOutboundUDPWrite{
+		Host:     addr.Host,
+		Port:     addr.Port,
+		AddrPort: netip.AddrPortFrom(ipToNetipAddr(ip), addr.Port),
+	})
 }
 
 // selectIP picks the resolved IP to send to, based on the socket's address family and the outbound mode.
@@ -448,11 +481,13 @@ func (d *directOutbound) UDP(reqAddr *AddrEx) (UDPConn, error) {
 				return nil, err
 			}
 		}
-		return &directOutboundUDPConn{
+		conn := &directOutboundUDPConn{
 			directOutbound: d,
 			UDPConn:        c,
 			State:          udpConnStateDualStack,
-		}, nil
+		}
+		conn.cacheWriteAddr(reqAddr)
+		return conn, nil
 	} else {
 		// Bind address specified,
 		// need to check what kind of address is in reqAddr
@@ -530,10 +565,12 @@ func (d *directOutbound) UDP(reqAddr *AddrEx) (UDPConn, error) {
 		}
 		// We don't support binding to both device & address at the same time,
 		// so d.DeviceName is ignored in this case.
-		return &directOutboundUDPConn{
+		conn := &directOutboundUDPConn{
 			directOutbound: d,
 			UDPConn:        c,
 			State:          state,
-		}, nil
+		}
+		conn.cacheWriteAddr(reqAddr)
+		return conn, nil
 	}
 }

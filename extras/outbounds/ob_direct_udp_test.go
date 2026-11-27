@@ -1,9 +1,12 @@
 package outbounds
 
 import (
+	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -130,4 +133,127 @@ func TestUDPConnAdapterAddresses(t *testing.T) {
 	_, addr, err := adapter.ReadFrom(nil)
 	assert.ErrorIs(t, err, assert.AnError)
 	assert.Equal(t, "", addr)
+}
+
+func testLookupCounter(ips []net.IP) (func(string) ([]net.IP, error), func() int) {
+	var mu sync.Mutex
+	n := 0
+	return func(string) ([]net.IP, error) {
+			mu.Lock()
+			n++
+			mu.Unlock()
+			return ips, nil
+		}, func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return n
+		}
+}
+
+func udpTestPeerWithDeadline(t *testing.T, network, addr string) (*net.UDPConn, uint16) {
+	conn, port := udpTestPeer(t, network, addr)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	return conn, port
+}
+
+// A hostname must be resolved once per UDP session, not once per packet.
+func TestDirectOutboundUDPCachesHostname(t *testing.T) {
+	peer, port := udpTestPeerWithDeadline(t, "udp4", "127.0.0.1:0")
+	lookup, count := testLookupCounter([]net.IP{net.ParseIP("127.0.0.1").To4()})
+	ob := NewDirectOutboundSimple(DirectOutboundModeAuto).(*directOutbound)
+	ob.LookupIPFunc = lookup
+	conn, err := ob.UDP(&AddrEx{Host: "cache.example", Port: 1})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	for i := range 3 {
+		payload := []byte(strconv.Itoa(i))
+		n, err := conn.WriteTo(payload, &AddrEx{Host: "cache.example", Port: port})
+		require.NoError(t, err)
+		assert.Equal(t, len(payload), n)
+		buf := make([]byte, 16)
+		n, _, err = peer.ReadFrom(buf)
+		require.NoError(t, err)
+		assert.Equal(t, payload, buf[:n])
+	}
+	assert.Equal(t, 1, count(), "hostname must be resolved once per UDP session")
+}
+
+// IP literals must keep the old behavior: no hostname resolution at all.
+func TestDirectOutboundUDPLiteralSkipsResolve(t *testing.T) {
+	peer, port := udpTestPeerWithDeadline(t, "udp4", "127.0.0.1:0")
+	lookup, count := testLookupCounter(nil)
+	ob := NewDirectOutboundSimple(DirectOutboundModeAuto).(*directOutbound)
+	ob.LookupIPFunc = lookup
+	conn, err := ob.UDP(&AddrEx{Host: "127.0.0.1", Port: 1})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	for range 3 {
+		n, err := conn.WriteTo([]byte("x"), &AddrEx{Host: "127.0.0.1", Port: port})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+	}
+	assert.Equal(t, 0, count(), "IP literals must not trigger hostname resolution")
+	buf := make([]byte, 16)
+	for range 3 {
+		n, _, err := peer.ReadFrom(buf)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("x"), buf[:n])
+	}
+}
+
+// Concurrent first packets of one flow must settle on one resolved address.
+func TestDirectOutboundUDPConcurrentResolveOnce(t *testing.T) {
+	peer, port := udpTestPeerWithDeadline(t, "udp4", "127.0.0.1:0")
+	lookup, count := testLookupCounter([]net.IP{net.ParseIP("127.0.0.1").To4()})
+	ob := NewDirectOutboundSimple(DirectOutboundModeAuto).(*directOutbound)
+	ob.LookupIPFunc = lookup
+	conn, err := ob.UDP(&AddrEx{Host: "concurrent.example", Port: 1})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const packets = 10
+	var wg sync.WaitGroup
+	wg.Add(packets)
+	for range packets {
+		go func() {
+			defer wg.Done()
+			_, err := conn.WriteTo([]byte("c"), &AddrEx{Host: "concurrent.example", Port: port})
+			assert.NoError(t, err)
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, 1, count(), "concurrent first packets must resolve once")
+	buf := make([]byte, 16)
+	for range packets {
+		n, _, err := peer.ReadFrom(buf)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("c"), buf[:n])
+	}
+}
+
+// The answer a resolver produced when the session was created must be reused
+// for packets, instead of being discarded and re-resolved by the built-in
+// resolver.
+func TestDirectOutboundUDPReusesResolverResult(t *testing.T) {
+	peer, port := udpTestPeerWithDeadline(t, "udp4", "127.0.0.1:0")
+	ob := NewDirectOutboundSimple(DirectOutboundModeAuto).(*directOutbound)
+	ob.LookupIPFunc = func(string) ([]net.IP, error) {
+		return nil, errors.New("unexpected packet-time resolve")
+	}
+	conn, err := ob.UDP(&AddrEx{
+		Host:        "resolver.example",
+		Port:        port,
+		ResolveInfo: &ResolveInfo{IPv4: net.ParseIP("127.0.0.1").To4()},
+	})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	_, err = conn.WriteTo([]byte("r"), &AddrEx{Host: "resolver.example", Port: port})
+	require.NoError(t, err, "must use the ResolveInfo supplied at UDP() time")
+	buf := make([]byte, 16)
+	n, _, err := peer.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("r"), buf[:n])
 }
