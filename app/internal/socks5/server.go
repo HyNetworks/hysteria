@@ -208,9 +208,13 @@ func (s *Server) handleUDP(conn net.Conn, req *socks5.Request) {
 	_ = sendUDPReply(conn, udpConn.LocalAddr().(*net.UDPAddr))
 
 	// UDP relay & SOCKS5 connection holder
+	var clientIP net.IP
+	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		clientIP = tcpAddr.IP
+	}
 	errChan := make(chan error, 2)
 	go func() {
-		err := s.udpServer(udpConn, hyUDP)
+		err := s.udpServer(udpConn, hyUDP, clientIP)
 		errChan <- err
 	}()
 	go func() {
@@ -220,7 +224,7 @@ func (s *Server) handleUDP(conn net.Conn, req *socks5.Request) {
 	closeErr = <-errChan
 }
 
-func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn) error {
+func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn, clientIP net.IP) error {
 	var clientAddr *net.UDPAddr
 	buf := make([]byte, udpBufferSize)
 	// local -> remote
@@ -238,7 +242,11 @@ func (s *Server) udpServer(udpConn *net.UDPConn, hyUDP client.HyUDPConn) error {
 		if clientAddr == nil {
 			// Before the first packet, we don't know what IP the client will use to send us packets,
 			// so we don't know what IP to return packets to.
-			// We treat whoever sends us the first packet as our client.
+			// We treat whoever sends us the first packet as our client,
+			// but it must come from the host holding the TCP control connection.
+			if clientIP != nil && !clientIP.IsUnspecified() && !clientIP.Equal(cAddr.IP) {
+				continue
+			}
 			clientAddr = cAddr
 			// Now that we know the client's address, we can start the
 			// remote -> local direction.

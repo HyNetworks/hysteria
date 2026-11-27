@@ -2,8 +2,10 @@ package trafficlogger
 
 import (
 	"cmp"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -99,8 +101,24 @@ func (s *trafficStatsServerImpl) UntraceStream(stream server.HyStream) {
 	delete(s.StreamMap, stream)
 }
 
+func (s *trafficStatsServerImpl) authorized(r *http.Request) bool {
+	if s.Secret == "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			return false
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	}
+	auth := r.Header.Get("Authorization")
+	if len(auth) != len(s.Secret) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(auth), []byte(s.Secret)) == 1
+}
+
 func (s *trafficStatsServerImpl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.Secret != "" && r.Header.Get("Authorization") != s.Secret {
+	if !s.authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

@@ -257,9 +257,9 @@ func removeHopByHopHeaders(header http.Header) {
 }
 
 func removeExtraHTTPHostPort(req *http.Request) {
-	host := req.Host
+	host := req.URL.Host
 	if host == "" {
-		host = req.URL.Host
+		host = req.Host
 	}
 	if pHost, port, err := net.SplitHostPort(host); err == nil && port == "80" {
 		host = pHost

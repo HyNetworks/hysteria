@@ -101,9 +101,10 @@ func parseProtoPort(s string) (protoPort, bool) {
 		return pp, true
 	}
 	// We allow either a single port or a range (e.g. "1000-2000")
-	ports := strings.SplitN(strings.TrimSpace(parts[1]), "-", 2)
+	portExpr := strings.TrimSpace(parts[1])
+	ports := strings.SplitN(portExpr, "-", 2)
 	if len(ports) == 1 {
-		p64, err := strconv.ParseUint(parts[1], 10, 16)
+		p64, err := strconv.ParseUint(portExpr, 10, 16)
 		if err != nil {
 			return protoPort{}, false
 		}

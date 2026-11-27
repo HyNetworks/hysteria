@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/net/idna"
+
 	"github.com/apernet/hysteria/extras/v2/outbounds/acl/v2geo"
 )
 
@@ -152,6 +154,11 @@ func (m *geositeMatcher) matchDomain(domain geositeDomain, host HostInfo) bool {
 }
 
 func (m *geositeMatcher) Match(host HostInfo) bool {
+	name, err := idna.ToUnicode(host.Name)
+	if err != nil {
+		name = host.Name
+	}
+	host.Name = normalizeHost(name)
 	for _, domain := range m.Domains {
 		if m.matchDomain(domain, host) {
 			return true
