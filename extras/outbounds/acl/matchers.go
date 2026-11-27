@@ -43,6 +43,7 @@ func (m *domainMatcher) Match(host HostInfo) bool {
 	if err != nil {
 		name = host.Name
 	}
+	name = normalizeHost(name)
 	switch m.Mode {
 	case domainMatchExact:
 		return name == m.Pattern
@@ -56,20 +57,32 @@ func (m *domainMatcher) Match(host HostInfo) bool {
 }
 
 func deepMatchRune(str, pattern []rune) bool {
-	for len(pattern) > 0 {
-		switch pattern[0] {
-		default:
-			if len(str) == 0 || str[0] != pattern[0] {
-				return false
+	s, p := 0, 0
+	star := -1
+	mark := 0
+	for s < len(str) {
+		if p < len(pattern) && (pattern[p] == '*' || pattern[p] == str[s]) {
+			if pattern[p] == '*' {
+				star = p
+				mark = s
+				p++
+				continue
 			}
-		case '*':
-			return deepMatchRune(str, pattern[1:]) ||
-				(len(str) > 0 && deepMatchRune(str[1:], pattern))
+			s++
+			p++
+			continue
 		}
-		str = str[1:]
-		pattern = pattern[1:]
+		if star < 0 {
+			return false
+		}
+		p = star + 1
+		mark++
+		s = mark
 	}
-	return len(str) == 0 && len(pattern) == 0
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
 }
 
 type allMatcher struct{}

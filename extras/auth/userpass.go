@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"net"
 	"strings"
 
@@ -34,8 +35,9 @@ func (a *UserPassAuthenticator) Authenticate(addr net.Addr, auth string, tx uint
 	if !ok {
 		return false, ""
 	}
-	rp, ok := a.users[u]
-	if !ok || rp != p {
+	rp, found := a.users[u]
+	passOK := subtle.ConstantTimeCompare([]byte(rp), []byte(p)) == 1
+	if !found || !passOK {
 		return false, ""
 	}
 	return true, u

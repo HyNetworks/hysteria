@@ -15,7 +15,10 @@ type padding struct {
 }
 
 func (p padding) String() string {
-	n := p.Min + rand.Intn(p.Max-p.Min)
+	n := p.Min
+	if p.Max > p.Min {
+		n += rand.Intn(p.Max - p.Min)
+	}
 	bs := make([]byte, n)
 	for i := range bs {
 		bs[i] = paddingChars[rand.Intn(len(paddingChars))]
@@ -24,8 +27,8 @@ func (p padding) String() string {
 }
 
 var (
-	authRequestPadding  = padding{Min: 256, Max: 2048}
-	authResponsePadding = padding{Min: 256, Max: 2048}
-	tcpRequestPadding   = padding{Min: 64, Max: 512}
-	tcpResponsePadding  = padding{Min: 128, Max: 1024}
+	authRequestPadding  = padding{Min: 1024}
+	authResponsePadding = padding{Min: 1024}
+	tcpRequestPadding   = padding{Min: 1200}
+	tcpResponsePadding  = padding{Min: 1200}
 )

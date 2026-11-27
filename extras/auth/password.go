@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"net"
 
 	"github.com/apernet/hysteria/core/v2/server"
@@ -14,9 +15,8 @@ type PasswordAuthenticator struct {
 }
 
 func (a *PasswordAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
-	if auth == a.Password {
+	if subtle.ConstantTimeCompare([]byte(a.Password), []byte(auth)) == 1 {
 		return true, "user"
-	} else {
-		return false, ""
 	}
+	return false, ""
 }

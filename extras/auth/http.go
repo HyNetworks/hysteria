@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	httpAuthTimeout = 10 * time.Second
+	httpAuthTimeout          = 10 * time.Second
+	httpAuthMaxResponseBytes = 64 * 1024
 )
 
 var _ server.Authenticator = &HTTPAuthenticator{}
@@ -64,7 +65,7 @@ func (a *HTTPAuthenticator) post(req *httpAuthRequest) (*httpAuthResponse, error
 	if resp.StatusCode != http.StatusOK {
 		return nil, errInvalidStatusCode
 	}
-	respData, err := io.ReadAll(resp.Body)
+	respData, err := io.ReadAll(io.LimitReader(resp.Body, httpAuthMaxResponseBytes))
 	if err != nil {
 		return nil, err
 	}

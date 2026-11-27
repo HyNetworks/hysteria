@@ -1,13 +1,17 @@
 package auth
 
 import (
+	"context"
 	"net"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apernet/hysteria/core/v2/server"
 )
+
+const commandAuthTimeout = 10 * time.Second
 
 var _ server.Authenticator = &CommandAuthenticator{}
 
@@ -16,7 +20,9 @@ type CommandAuthenticator struct {
 }
 
 func (a *CommandAuthenticator) Authenticate(addr net.Addr, auth string, tx uint64) (ok bool, id string) {
-	cmd := exec.Command(a.Cmd, addr.String(), auth, strconv.Itoa(int(tx)))
+	ctx, cancel := context.WithTimeout(context.Background(), commandAuthTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, a.Cmd, addr.String(), auth, strconv.Itoa(int(tx)))
 	out, err := cmd.Output()
 	if err != nil {
 		// This includes failing to execute the command,

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,6 +61,16 @@ const (
 	masqueradeProxyMaxIdleConnections  = 100
 	masqueradeProxyMaxIdleConnsPerHost = 32
 )
+
+const masqNotFoundBody = `<!DOCTYPE html>
+<html>
+<head><title>404 Not Found</title></head>
+<body>
+<h1>Not Found</h1>
+<p>The requested URL was not found on this server.</p>
+</body>
+</html>
+`
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
@@ -1513,6 +1524,9 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
+		if c.TrafficStats.Secret == "" && !isLoopbackListen(c.TrafficStats.Listen) {
+			return configError{Field: "trafficStats.secret", Err: errors.New("secret must be set when trafficStats.listen is not a loopback address")}
+		}
 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
@@ -1619,12 +1633,20 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 	var handler http.Handler
 	switch strings.ToLower(c.Masquerade.Type) {
 	case "", "404":
-		handler = http.NotFoundHandler()
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(masqNotFoundBody))
+		})
 	case "file":
 		if c.Masquerade.File.Dir == "" {
 			return configError{Field: "masquerade.file.dir", Err: errors.New("empty file directory")}
 		}
-		handler = http.FileServer(http.Dir(c.Masquerade.File.Dir))
+		mfs, err := newMasqFileSystem(c.Masquerade.File.Dir)
+		if err != nil {
+			return configError{Field: "masquerade.file.dir", Err: err}
+		}
+		handler = http.FileServer(mfs)
 	case "proxy":
 		var err error
 		handler, err = newMasqueradeProxyHandler(c.Masquerade.Proxy)
@@ -1667,9 +1689,11 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
 			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
 			TLSConfig: &tls.Config{
-				Certificates:             hyConfig.TLSConfig.Certificates,
-				GetCertificate:           hyConfig.TLSConfig.GetCertificate,
-				EncryptedClientHelloKeys: hyConfig.TLSConfig.ECHKeys,
+				Certificates:                hyConfig.TLSConfig.Certificates,
+				GetCertificate:              hyConfig.TLSConfig.GetCertificate,
+				EncryptedClientHelloKeys:    hyConfig.TLSConfig.ECHKeys,
+				GetEncryptedClientHelloKeys: hyConfig.TLSConfig.GetECHKeys,
+				MinVersion:                  tls.VersionTLS12,
 			},
 			ForceHTTPS: c.Masquerade.ForceHTTPS,
 		}
@@ -1833,9 +1857,10 @@ func (l *serverLogger) TCPRequest(addr net.Addr, id, reqAddr string) {
 func (l *serverLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("TCP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
+		return
 	}
+	logger.Debug("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
+	logger.Warn("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("error", "outbound dial failed"))
 }
 
 func (l *serverLogger) UDPRequest(addr net.Addr, id string, sessionID uint32, reqAddr string) {
@@ -1848,6 +1873,61 @@ func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err 
 	} else {
 		logger.Warn("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
 	}
+}
+
+type masqFileSystem struct {
+	root string
+}
+
+func newMasqFileSystem(dir string) (*masqFileSystem, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, err
+	}
+	return &masqFileSystem{root: resolved}, nil
+}
+
+func (m *masqFileSystem) Open(name string) (http.File, error) {
+	for _, seg := range strings.Split(strings.TrimPrefix(name, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." || seg == ".well-known" {
+			continue
+		}
+		if strings.HasPrefix(seg, ".") {
+			return nil, os.ErrNotExist
+		}
+	}
+	full := filepath.Join(m.root, filepath.FromSlash(name))
+	resolved, err := filepath.EvalSymlinks(full)
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+	if resolved != m.root && !strings.HasPrefix(resolved, m.root+string(filepath.Separator)) {
+		return nil, os.ErrNotExist
+	}
+	f, err := os.Open(resolved)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if st.IsDir() {
+		for _, idx := range []string{"index.html", "index.htm"} {
+			if ff, err := os.Open(filepath.Join(resolved, idx)); err == nil {
+				_ = ff.Close()
+				return f, nil
+			}
+		}
+		_ = f.Close()
+		return nil, os.ErrNotExist
+	}
+	return f, nil
 }
 
 type masqHandlerLogWrapper struct {

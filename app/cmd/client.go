@@ -387,7 +387,13 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 	hyConfig.TLSConfig.InsecureSkipVerify = c.TLS.Insecure
 	if c.TLS.PinSHA256 != "" {
 		nHash := normalizeCertHash(c.TLS.PinSHA256)
+		if len(nHash) != 64 || !isLowerHex(nHash) {
+			return configError{Field: "tls.pinSHA256", Err: errors.New("must be a SHA-256 hash in hex (64 hex characters)")}
+		}
 		hyConfig.TLSConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("no certificate presented by the server")
+			}
 			cert := rawCerts[0] // only check the end-entity cert hash in the chain of trust
 			hash := sha256.Sum256(cert)
 			hashHex := hex.EncodeToString(hash[:])
@@ -396,6 +402,16 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 			}
 			// No match
 			return errors.New("no certificate matches the pinned hash")
+		}
+	}
+	if c.TLS.Insecure {
+		if c.TLS.PinSHA256 == "" && c.TLS.CA == "" {
+			if os.Getenv("HYSTERIA_ALLOW_INSECURE") != "1" {
+				return configError{Field: "tls.insecure", Err: errors.New("refusing to disable TLS verification without tls.pinSHA256 or tls.ca; set one of them, or set HYSTERIA_ALLOW_INSECURE=1 to accept that the content can be intercepted")}
+			}
+			logger.Warn("TLS verification is disabled with no pin and no CA configured: anyone on the network path can intercept and modify this connection")
+		} else {
+			logger.Warn("TLS verification is disabled: the connection is only protected by the configured pin or CA")
 		}
 	}
 	if c.TLS.CA != "" {
@@ -1019,6 +1035,9 @@ func clientSOCKS5(config socks5Config, c client.Client) error {
 			return u == username && p == password
 		}
 	}
+	if authFunc == nil && !isLoopbackListen(config.Listen) {
+		logger.Warn("SOCKS5 proxy is reachable from the network without authentication: anyone who can reach it can use your tunnel", zap.String("addr", config.Listen))
+	}
 	s := socks5.Server{
 		HyClient:    c,
 		AuthFunc:    authFunc,
@@ -1046,6 +1065,9 @@ func clientHTTP(config httpConfig, c client.Client) error {
 	}
 	if config.Realm == "" {
 		config.Realm = "Hysteria"
+	}
+	if authFunc == nil && !isLoopbackListen(config.Listen) {
+		logger.Warn("HTTP proxy is reachable from the network without authentication: anyone who can reach it can use your tunnel", zap.String("addr", config.Listen))
 	}
 	h := http.Server{
 		HyClient:    c,
@@ -1269,6 +1291,31 @@ func normalizeCertHash(hash string) string {
 	return r
 }
 
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'f' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // singleUseConnFactory invokes Open exactly once to produce the underlying
 // conn. It defers any allocation to the moment core/client.connect() actually
 // asks for the conn, so config-validation failures inside NewClient (e.g.
@@ -1359,9 +1406,10 @@ func (l *socks5Logger) TCPRequest(addr net.Addr, reqAddr string) {
 func (l *socks5Logger) TCPError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("SOCKS5 TCP closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		return
 	}
+	logger.Debug("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+	logger.Warn("SOCKS5 TCP error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 func (l *socks5Logger) UDPRequest(addr net.Addr) {
@@ -1385,9 +1433,10 @@ func (l *httpLogger) ConnectRequest(addr net.Addr, reqAddr string) {
 func (l *httpLogger) ConnectError(addr net.Addr, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("HTTP CONNECT closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+		return
 	}
+	logger.Debug("HTTP CONNECT error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr), zap.Error(err))
+	logger.Warn("HTTP CONNECT error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 func (l *httpLogger) HTTPRequest(addr net.Addr, reqURL string) {
@@ -1397,9 +1446,10 @@ func (l *httpLogger) HTTPRequest(addr net.Addr, reqURL string) {
 func (l *httpLogger) HTTPError(addr net.Addr, reqURL string, err error) {
 	if err == nil {
 		logger.Debug("HTTP closed", zap.String("addr", addr.String()), zap.String("reqURL", reqURL))
-	} else {
-		logger.Warn("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
+		return
 	}
+	logger.Debug("HTTP error", zap.String("addr", addr.String()), zap.String("reqURL", reqURL), zap.Error(err))
+	logger.Warn("HTTP error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 type tcpLogger struct{}
@@ -1439,9 +1489,10 @@ func (l *tcpTProxyLogger) Connect(addr, reqAddr net.Addr) {
 func (l *tcpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("TCP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
-	} else {
-		logger.Warn("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		return
 	}
+	logger.Debug("TCP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	logger.Warn("TCP transparent proxy error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 type udpTProxyLogger struct{}
@@ -1453,9 +1504,10 @@ func (l *udpTProxyLogger) Connect(addr, reqAddr net.Addr) {
 func (l *udpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("UDP transparent proxy closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
-	} else {
-		logger.Warn("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		return
 	}
+	logger.Debug("UDP transparent proxy error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	logger.Warn("UDP transparent proxy error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 type tcpRedirectLogger struct{}
@@ -1467,9 +1519,10 @@ func (l *tcpRedirectLogger) Connect(addr, reqAddr net.Addr) {
 func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
 	if err == nil {
 		logger.Debug("TCP redirect closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
-	} else {
-		logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+		return
 	}
+	logger.Debug("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.Error(err))
 }
 
 type tunLogger struct{}
@@ -1481,9 +1534,10 @@ func (l *tunLogger) TCPRequest(addr, reqAddr string) {
 func (l *tunLogger) TCPError(addr, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("TUN TCP closed", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
+		return
 	}
+	logger.Debug("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
+	logger.Warn("TUN TCP error", zap.String("addr", addr), zap.Error(err))
 }
 
 func (l *tunLogger) UDPRequest(addr string) {

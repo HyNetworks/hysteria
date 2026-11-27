@@ -22,6 +22,8 @@ import (
 const (
 	closeErrCodeOK                  = 0x100 // HTTP3 ErrCodeNoError
 	closeErrCodeTrafficLimitReached = 0x107 // HTTP3 ErrCodeExcessiveLoad
+
+	maxAuthFailuresPerConn = 16
 )
 
 type Server interface {
@@ -147,6 +149,7 @@ type h3sHandler struct {
 	authenticated bool
 	authMutex     sync.Mutex
 	authID        string
+	authFailures  int
 	connID        uint32 // a random id for dump streams
 
 	udpSM *udpSessionManager // Only set after authentication
@@ -172,6 +175,10 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				RxAuto:     h.config.IgnoreClientBandwidth,
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
+			return
+		}
+		if h.authFailures >= maxAuthFailuresPerConn {
+			h.masqHandler(w, r)
 			return
 		}
 		authReq := protocol.AuthRequestFromHeader(r.Header)
@@ -235,6 +242,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}()
 			}
 		} else {
+			h.authFailures++
 			// Auth failed, pretend to be a normal HTTP server
 			h.masqHandler(w, r)
 		}
@@ -320,7 +328,7 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 	}, reqAddr)
 	if err != nil {
 		if !hooked {
-			_ = protocol.WriteTCPResponse(stream, false, err.Error())
+			_ = protocol.WriteTCPResponse(stream, false, "dial failed")
 		}
 		_ = stream.Close()
 		// Log the error

@@ -79,6 +79,11 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		RootCAs:                        c.config.TLSConfig.RootCAs,
 		GetClientCertificate:           c.config.TLSConfig.GetClientCertificate,
 		EncryptedClientHelloConfigList: c.config.TLSConfig.ECHConfigList,
+		CurvePreferences: []tls.CurveID{
+			tls.X25519MLKEM768,
+			tls.X25519,
+			tls.CurveP256,
+		},
 	}
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,
